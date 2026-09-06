@@ -39,6 +39,8 @@ rdrp0=$(ethtool -S "$IF" | awk '/mac_rx_dropped/{print $2}')
 
 mbps() { awk -v b="$1" -v s="$2" 'BEGIN{printf "%.1f Mbit/s (%.2f MB/s)", b*8/s/1e6, b/s/1048576}'; }
 
+echo "-- 0. large ping to the gateway (RX of full-size frames, no TCP) --"
+ping -c 3 -s 1400 -W 1 -I "$IF" "$GW" | tail -n 2 | sed 's/^/   /'
 echo "-- 1. single-stream download, 15 s cap --"
 t=$( curl -s --interface "$IF" --max-time 15 -o /dev/null -w '%{size_download} %{time_total}' "$URL" 2>/dev/null )
 sz=$(echo "$t"|awk '{print $1}'); el=$(echo "$t"|awk '{print $2}'); echo "   $(mbps ${sz:-0} ${el:-15})"

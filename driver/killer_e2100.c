@@ -53,6 +53,9 @@
 #define CCSR_PECR1    0x140    /* PCIe controller: bits 26-31 = DMA/descriptor/PIO CSB priority */
 #define CCSR_ACR      0x800    /* CSB arbiter: bit 7 COREDIS, bits 13-15 PIPE_DEP (outstanding transactions - 1) */
 #define ACR_COREDIS   0x01000000u
+#define CCSR_AER      0x808    /* arbiter event register, w1c */
+#define CCSR_AEATR    0x818
+#define CCSR_AEADR    0x81c
 #define ACR_PIPE_DEP_MASK 0x00070000u
 #define ACR_PIPE_DEP(n)   (((n) & 7) << 16)
 #define CCSR_SPCR     0x110    /* system priority: bits 18-23 = eTSEC data/BD/emergency CSB priority */
@@ -254,9 +257,6 @@ module_param(pipe_dep, int, 0444);
 MODULE_PARM_DESC(pipe_dep, "CSB arbiter pipeline depth field 0..7 (default 3 = 4 outstanding)");
 
 /* experiments */
-static int core_off;
-module_param(core_off, int, 0444);
-MODULE_PARM_DESC(core_off, "1: deny the card's idle PowerPC core the bus (ACR[COREDIS]) so it cannot compete");
 static int fifo_defaults;
 module_param(fifo_defaults, int, 0444);
 MODULE_PARM_DESC(fifo_defaults, "1: leave the eTSEC RX FIFO pause/alarm thresholds at their reset values");
@@ -299,7 +299,7 @@ struct kl {
 	} batch;
 	u64 bd_tr, bd_ov, bd_cr, bd_sh, bd_no, bd_lg, bd_frag;
 	u64 ev_xfun, ev_txe, ev_bsy, ev_eberr;
-	u64 wdma_chains, wdma_timeouts, wdma_errors;
+	u64 wdma_chains, wdma_timeouts, wdma_errors, wdma_desc_notdone;
 	u32 acr_orig;
 };
 
@@ -448,6 +448,45 @@ static int wdma_selftest_order(struct kl *k, int order)
 	return 0;
 }
 
+/* 8 KB from card DDR (outside the BAR1 window) to host, whole and in pieces */
+static int wdma_selftest_large(struct kl *k, int pieces)
+{
+	u32 *hscr = k->area + HSCR_OFF, src = C_RXBUF, seq = 0xB16B0000u | pieces, d = C_DESC_OFF, off = 0;
+	u32 piece = 8192 / pieces;
+	int i;
+
+	/* fill the source via the BAR1 window temporarily aimed at it */
+	pw(k, PEX_EPIWTAR1, C_RXBUF | 1);
+	for (i = 0; i < 2048; i++)
+		iowrite32(0xA5000000u ^ (i * 0x9E3779B1u), k->win + i * 4);
+	(void)ioread32(k->win);
+	pw(k, PEX_EPIWTAR1, DDR_WIN | 1);
+	memset(hscr, 0, 8192 > 0x1000 ? 0x1000 : 8192);
+	WRITE_ONCE(*marker(k), 0);
+	wmb();
+	for (i = 0; i < pieces; i++, off += piece, d += DESC_SZ)
+		wdma_desc(k, d, src + off, OB_BAR + RXSLOT_OFF + off, piece / 4, DDR_WIN + d + DESC_SZ);
+	wdma_desc(k, d, DDR_WIN + C_SEQ_OFF, OB_BAR + MARKER_OFF, 1, 0);
+	wdma_desc_null(k, d + DESC_SZ);
+	wdma_kick(k, DDR_WIN + C_DESC_OFF, seq);
+	for (i = 0; i < 5000 && READ_ONCE(*marker(k)) != seq; i++)
+		udelay(1);
+	if (READ_ONCE(*marker(k)) != seq) {
+		dev_info(&k->pdev->dev, "wdma large selftest (%d pieces): no marker, stat %08x\n", pieces, pr(k, PEX_WDMA_STAT));
+		return -EIO;
+	}
+	dma_rmb();
+	hscr = k->area + RXSLOT_OFF;
+	for (i = 0; i < 2048; i++)
+		if (hscr[i] != (0xA5000000u ^ (i * 0x9E3779B1u))) {
+			dev_info(&k->pdev->dev, "wdma large selftest (%d pieces): data wrong at byte %d (%08x), desc0 status %08x\n",
+				 pieces, i * 4, hscr[i], ioread32(k->win + C_DESC_OFF + (k->desc_order ? 4 : 12)));
+			return -EIO;
+		}
+	dev_info(&k->pdev->dev, "wdma large selftest (%d pieces of %u): ok\n", pieces, piece);
+	return 0;
+}
+
 static int wdma_selftest(struct kl *k)
 {
 	static const int orders[] = { 1, 0 };     /* control-word-first is the one that works */
@@ -461,6 +500,8 @@ static int wdma_selftest(struct kl *k)
 				dev_info(&k->pdev->dev, "wdma selftest passed: descriptor order %d (%s)%s\n",
 					 orders[i], orders[i] ? "control word first" : "next pointer first",
 					 attempt ? " after retry" : "");
+				if (wdma_selftest_large(k, 1) || wdma_selftest_large(k, 16))
+					return -EIO;
 				return 0;
 			}
 		}
@@ -533,9 +574,9 @@ static void hw_start(struct kl *k)
 
 	iowrite32be((ioread32be(k->ccsr + CCSR_SPCR) & ~SPCR_TSEC_MASK) | SPCR_TSEC_PRIO(etsec_prio),
 		    k->ccsr + CCSR_SPCR);
-	dev_info(&k->pdev->dev, "bus: SPCR %08x PECR1 %08x ACR %08x (etsec_prio %d core_off %d fifo_defaults %d rx_batch %d dma_chunk %d)\n",
+	dev_info(&k->pdev->dev, "bus: SPCR %08x PECR1 %08x ACR %08x (etsec_prio %d fifo_defaults %d rx_batch %d dma_chunk %d)\n",
 		 ioread32be(k->ccsr + CCSR_SPCR), ioread32be(k->ccsr + CCSR_PECR1), ioread32be(k->ccsr + CCSR_ACR),
-		 etsec_prio, core_off, fifo_defaults, rx_batch, dma_chunk);
+		 etsec_prio, fifo_defaults, rx_batch, dma_chunk);
 	mac_set_speed(k, k->speed, k->duplex == DUPLEX_FULL);
 	ew(k, FIFO_TX_THR, tx_thr);
 	if (!fifo_defaults) {
@@ -663,7 +704,14 @@ static int rx_batch_deliver(struct kl *k)
 {
 	struct net_device *ndev = k->ndev;
 	int i, delivered = 0;
+	u32 st;
 	dma_rmb();                        /* marker seen: now the slot data is safe to read */
+	/* sample the first data descriptor's status word: Done + error bits */
+	st = ioread32(k->win + C_DESC_OFF + (k->desc_order ? 4 : 12));
+	if (st & ~DESC_DONE)
+		k->wdma_errors++;
+	if (!(st & DESC_DONE))
+		k->wdma_desc_notdone++;
 	for (i = 0; i < k->batch.n; i++) {
 		if (k->batch.slot[i] >= 0) {
 			u16 len = k->batch.len[i] - ETH_FCS_LEN;
@@ -957,7 +1005,7 @@ static const char kl_stat_names[][ETH_GSTRING_LEN] = {
 	"mac_tx_packets", "mac_tx_bytes", "mac_tx_dropped", "mac_tx_crc_err", "mac_tx_underrun",
 	"bd_rx_truncated", "bd_rx_overrun", "bd_rx_crc", "bd_rx_short", "bd_rx_nonoctet", "bd_rx_large", "bd_rx_fragmented",
 	"ev_tx_underrun", "ev_tx_error", "ev_rx_busy", "ev_bus_error",
-	"wdma_chains", "wdma_timeouts", "wdma_errors",
+	"wdma_chains", "wdma_timeouts", "wdma_desc_errors", "wdma_desc_notdone",
 };
 
 static int kl_get_sset_count(struct net_device *ndev, int sset)
@@ -983,7 +1031,7 @@ static void kl_get_ethtool_stats(struct net_device *ndev, struct ethtool_stats *
 	data[n++] = k->bd_tr; data[n++] = k->bd_ov; data[n++] = k->bd_cr; data[n++] = k->bd_sh;
 	data[n++] = k->bd_no; data[n++] = k->bd_lg; data[n++] = k->bd_frag;
 	data[n++] = k->ev_xfun; data[n++] = k->ev_txe; data[n++] = k->ev_bsy; data[n++] = k->ev_eberr;
-	data[n++] = k->wdma_chains; data[n++] = k->wdma_timeouts; data[n++] = k->wdma_errors;
+	data[n++] = k->wdma_chains; data[n++] = k->wdma_timeouts; data[n++] = k->wdma_errors; data[n++] = k->wdma_desc_notdone;
 }
 
 static const struct ethtool_ops kl_ethtool_ops = {
@@ -1083,10 +1131,11 @@ static int kl_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	{
 		u32 acr = ioread32be(k->ccsr + CCSR_ACR);
 		k->acr_orig = acr & ~ACR_COREDIS;      /* never leave the core disabled behind us */
-		iowrite32be((acr & ~(ACR_PIPE_DEP_MASK | ACR_COREDIS)) | ACR_PIPE_DEP(pipe_dep) |
-			    (core_off ? ACR_COREDIS : 0), k->ccsr + CCSR_ACR);
-		dev_info(&pdev->dev, "CSB arbiter ACR %08x -> %08x (pipe_dep %d, core_off %d)\n",
-			 acr, ioread32be(k->ccsr + CCSR_ACR), pipe_dep, core_off);
+		iowrite32be((acr & ~(ACR_PIPE_DEP_MASK | ACR_COREDIS)) | ACR_PIPE_DEP(pipe_dep), k->ccsr + CCSR_ACR);
+		dev_info(&pdev->dev, "CSB arbiter ACR %08x -> %08x (pipe_dep %d), AER %08x AEATR %08x AEADR %08x\n",
+			 acr, ioread32be(k->ccsr + CCSR_ACR), pipe_dep, ioread32be(k->ccsr + CCSR_AER),
+			 ioread32be(k->ccsr + CCSR_AEATR), ioread32be(k->ccsr + CCSR_AEADR));
+		iowrite32be(0xffffffffu, k->ccsr + CCSR_AER);
 	}
 	ob_window_set(k, true);
 
