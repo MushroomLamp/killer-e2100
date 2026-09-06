@@ -602,7 +602,7 @@ static int rx_batch_deliver(struct kl *k)
 {
 	struct net_device *ndev = k->ndev;
 	int i, delivered = 0;
-
+	dma_rmb();                        /* marker seen: now the slot data is safe to read */
 	for (i = 0; i < k->batch.n; i++) {
 		if (k->batch.slot[i] >= 0) {
 			u16 len = k->batch.len[i] - ETH_FCS_LEN;

@@ -5,12 +5,15 @@
 set -u
 HERE=$(dirname "$(readlink -f "$0")")
 DEV=0000:07:00.0
-URL=http://speedtest.tele2.net/10MB.zip
-UPURL=http://speedtest.tele2.net/upload.php
+# Cloudflare's speed endpoints are anycast: a nearby server from anywhere.
+# (speedtest.tele2.net is in Sweden: 420 ms RTT from Australia, useless for single-stream tests.)
+URL='https://speed.cloudflare.com/__down?bytes=100000000'
+UPURL='https://speed.cloudflare.com/__up'
 trap 'nmcli radio wifi on >/dev/null 2>&1; echo "(wifi back on)"' EXIT
 
+ARGS=(); for a in "$@"; do [ "$a" = hold ] && HOLD=1 || ARGS+=("$a"); done
 lsmod | grep -q '^killer_e2100' && rmmod killer_e2100 && sleep 1
-insmod "$HERE/driver/killer_e2100.ko" "$@" || exit 1
+insmod "$HERE/driver/killer_e2100.ko" "${ARGS[@]}" || exit 1
 sleep 1
 IF=$(ls /sys/bus/pci/devices/$DEV/net/ 2>/dev/null | head -1)
 [ -n "$IF" ] || { echo "no netdev (self-test may have failed; dmesg):"; dmesg|grep -i wdma|tail -3; exit 1; }
@@ -24,6 +27,13 @@ POLL=$(cat /sys/module/killer_e2100/parameters/poll_us)
 GBIT=$(cat /sys/module/killer_e2100/parameters/gigabit)
 LINK=$(dmesg | grep -E "$IF: Link is Up" | tail -1 | grep -oE '[0-9]+[GM]bps/[A-Za-z]+')
 echo "== $IF  ip $IP  gw $GW  link $LINK  poll_us=$POLL gigabit=$GBIT =="
+SRV=$(getent ahostsv4 speed.cloudflare.com | awk '{print $1; exit}')
+echo "-- ICMP round trip to speed.cloudflare.com ($SRV) --"
+ping -c 4 -i 0.3 -I "$IF" "$SRV" 2>/dev/null | tail -n 1 | sed 's/^/   /'
+if [ "${HOLD:-0}" = 1 ]; then
+	echo; echo ">>> driver loaded, wifi OFF. Run your browser speedtest now, then press Enter here. <<<"
+	read -r _
+fi
 c0=$(ethtool -S "$IF" | awk '/wdma_chains/{print $2}')
 rdrp0=$(ethtool -S "$IF" | awk '/mac_rx_dropped/{print $2}')
 
@@ -47,7 +57,9 @@ rm -rf "$tmp"
 echo "   aggregate $(mbps ${tot:-0} ${el:-15})"
 
 echo "-- 3. single-stream upload, 15 s cap --"
-t=$( curl -s --interface "$IF" --max-time 15 -o /dev/null -w '%{size_upload} %{time_total}' -T <(head -c 50000000 /dev/zero) "$UPURL" 2>&1 )
+head -c 50000000 /dev/zero > /tmp/kl_up.bin
+t=$( curl -s --interface "$IF" --max-time 15 -o /dev/null -w '%{size_upload} %{time_total}' -X POST --data-binary @/tmp/kl_up.bin "$UPURL" 2>&1 )
+rm -f /tmp/kl_up.bin
 sz=$(echo "$t"|awk '{print $1}'); el=$(echo "$t"|awk '{print $2}'); echo "   $(mbps ${sz:-0} ${el:-15})"
 
 c1=$(ethtool -S "$IF" | awk '/wdma_chains/{print $2}')
