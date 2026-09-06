@@ -7,7 +7,7 @@ HERE=$(dirname "$(readlink -f "$0")")
 DEV=0000:07:00.0
 # Cloudflare's speed endpoints are anycast: a nearby server from anywhere.
 # (speedtest.tele2.net is in Sweden: 420 ms RTT from Australia, useless for single-stream tests.)
-URL='https://speed.cloudflare.com/__down?bytes=50000000'   # 100 MB gets a 403
+URL='https://speed.cloudflare.com/__down?bytes=20000000'
 UPURL='https://speed.cloudflare.com/__up'
 trap 'nmcli radio wifi on >/dev/null 2>&1; echo "(wifi back on)"' EXIT
 
@@ -42,8 +42,8 @@ mbps() { awk -v b="$1" -v s="$2" 'BEGIN{printf "%.1f Mbit/s (%.2f MB/s)", b*8/s/
 echo "-- 0. large ping to the gateway (RX of full-size frames, no TCP) --"
 ping -c 3 -s 1400 -W 1 -I "$IF" "$GW" | tail -n 2 | sed 's/^/   /'
 echo "-- 1. single-stream download, 15 s cap --"
-t=$( curl -s --interface "$IF" --max-time 15 -o /dev/null -w '%{size_download} %{time_total}' "$URL" 2>/dev/null )
-sz=$(echo "$t"|awk '{print $1}'); el=$(echo "$t"|awk '{print $2}'); echo "   $(mbps ${sz:-0} ${el:-15})"
+t=$( curl -s --interface "$IF" --max-time 15 -o /dev/null -w '%{size_download} %{time_total} %{http_code}' "$URL" 2>/dev/null )
+sz=$(echo "$t"|awk '{print $1}'); el=$(echo "$t"|awk '{print $2}'); echo "   $(mbps ${sz:-0} ${el:-15})  (http $(echo "$t"|awk '{print $3}'), $sz bytes)"
 
 echo "-- 2. six parallel downloads, 15 s cap --"
 start=$(date +%s.%N)
