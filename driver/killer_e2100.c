@@ -184,9 +184,10 @@
 /* ---- card DDR through BAR1 (card-local DDR_WIN + off, 64 KB) ---- */
 #define NRX 512
 #define C_RXBD_OFF 0x0000                            /* NRX x 8 */
-#define C_DESC_OFF 0x1000                            /* (BATCH + 2) x 32; RX BDs use 0x0000..0x0FFF */
-#define C_SEQ_OFF  0x3000
-#define C_SCR_OFF  0x3800                            /* self-test pattern, 256 B */
+#define C_DESC_OFF 0x1000                            /* descriptor area, 16 KB = 512 x 32; RX BDs use 0x0000..0x0FFF */
+#define NDESC 512
+#define C_SEQ_OFF  0x5000
+#define C_SCR_OFF  0x5800                            /* self-test pattern, 256 B */
 #define DESC_SZ 32
 #define C_RXBUF (DDR_WIN + 0x100000)                 /* NRX x 2 KB, not host-visible */
 
@@ -215,6 +216,17 @@ MODULE_PARM_DESC(gigabit, "advertise 1000BASE-T (default 0)");
 static int flowctrl = 1;
 module_param(flowctrl, int, 0444);
 MODULE_PARM_DESC(flowctrl, "advertise and use 802.3x PAUSE flow control (default 1)");
+
+/*
+ * Bytes per WDMA descriptor. The engine issues every 32-byte read of a
+ * descriptor at once, so a whole 1514-byte frame is a 48-read burst that
+ * starves the MAC's writes into the same DRAM (its RX FIFO then overruns).
+ * Splitting a frame across several descriptors caps the burst and leaves
+ * gaps, at the cost of a few more descriptor writes per frame.
+ */
+static int dma_chunk = 512;
+module_param(dma_chunk, int, 0444);
+MODULE_PARM_DESC(dma_chunk, "bytes per write-DMA descriptor (64..2048, default 512)");
 
 /* frames per WDMA chain: shorter chains = shorter bursts of card-memory reads */
 static int rx_batch = BATCH;
@@ -521,9 +533,9 @@ static void hw_start(struct kl *k)
 
 	iowrite32be((ioread32be(k->ccsr + CCSR_SPCR) & ~SPCR_TSEC_MASK) | SPCR_TSEC_PRIO(etsec_prio),
 		    k->ccsr + CCSR_SPCR);
-	dev_info(&k->pdev->dev, "bus: SPCR %08x PECR1 %08x ACR %08x (etsec_prio %d core_off %d fifo_defaults %d rx_batch %d)\n",
+	dev_info(&k->pdev->dev, "bus: SPCR %08x PECR1 %08x ACR %08x (etsec_prio %d core_off %d fifo_defaults %d rx_batch %d dma_chunk %d)\n",
 		 ioread32be(k->ccsr + CCSR_SPCR), ioread32be(k->ccsr + CCSR_PECR1), ioread32be(k->ccsr + CCSR_ACR),
-		 etsec_prio, core_off, fifo_defaults, rx_batch);
+		 etsec_prio, core_off, fifo_defaults, rx_batch, dma_chunk);
 	mac_set_speed(k, k->speed, k->duplex == DUPLEX_FULL);
 	ew(k, FIFO_TX_THR, tx_thr);
 	if (!fifo_defaults) {
@@ -695,10 +707,10 @@ static void rx_batch_abort(struct kl *k, const char *why)
 static int rx_batch_start(struct kl *k)
 {
 	unsigned int idx = k->rx_cur;
-	int n = 0, slots = 0, i;
-	u32 d = C_DESC_OFF, next_used = 0;
+	int n = 0, slots = 0, i, ndesc = 0, max_per_frame = DIV_ROUND_UP(BUFSZ, dma_chunk);
+	u32 d = C_DESC_OFF;
 
-	while (n < rx_batch) {
+	while (n < rx_batch && ndesc + max_per_frame + 2 <= NDESC) {
 		u32 sl = ioread32be(k->win + C_RXBD_OFF + idx * 8);
 		u16 st = sl >> 16, len = sl & 0xffff;
 
@@ -713,6 +725,7 @@ static int rx_batch_start(struct kl *k)
 			k->batch.slot[n] = -1;
 		} else {
 			k->batch.slot[n] = slots++;
+			ndesc += DIV_ROUND_UP(len, dma_chunk);
 		}
 		idx = (idx + 1) % NRX;
 		n++;
@@ -720,15 +733,21 @@ static int rx_batch_start(struct kl *k)
 	if (!n)
 		return 0;
 
-	/* one descriptor per good frame, chained in memory order */
+	/* each good frame in dma_chunk-sized pieces, chained in memory order */
 	for (i = 0; i < n; i++) {
+		u32 src, dst, left, off = 0;
 		if (k->batch.slot[i] < 0)
 			continue;
-		wdma_desc(k, d, C_RXBUF + k->batch.idx[i] * BUFSZ,
-			  OB_BAR + RXSLOT_OFF + k->batch.slot[i] * BUFSZ,
-			  DIV_ROUND_UP(k->batch.len[i], 4), DDR_WIN + d + DESC_SZ);
-		d += DESC_SZ;
-		next_used++;
+		src = C_RXBUF + k->batch.idx[i] * BUFSZ;
+		dst = OB_BAR + RXSLOT_OFF + k->batch.slot[i] * BUFSZ;
+		left = k->batch.len[i];
+		while (left) {
+			u32 piece = left < (u32)dma_chunk ? left : (u32)dma_chunk;
+			wdma_desc(k, d, src + off, dst + off, DIV_ROUND_UP(piece, 4), DDR_WIN + d + DESC_SZ);
+			d += DESC_SZ;
+			off += piece;
+			left -= piece;
+		}
 	}
 	/* marker: copies the sequence word into host RAM after all the data */
 	wdma_desc(k, d, DDR_WIN + C_SEQ_OFF, OB_BAR + MARKER_OFF, 1, 0);
@@ -999,9 +1018,10 @@ static int kl_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	static const u8 mac[ETH_ALEN] = { 0x02, 0x4b, 0x49, 0x4c, 0x4c, 0x52 };
 
 	BUILD_BUG_ON(AREA_END > OB_SIZE);
-	BUILD_BUG_ON(C_DESC_OFF + (BATCH + 2) * DESC_SZ > C_SEQ_OFF);
+	BUILD_BUG_ON(C_DESC_OFF + NDESC * DESC_SZ > C_SEQ_OFF);
 	BUILD_BUG_ON(C_RXBD_OFF + NRX * 8 > C_DESC_OFF);
 	rx_batch = clamp(rx_batch, 1, BATCH);
+	dma_chunk = clamp(dma_chunk, 64, BUFSZ) & ~63;
 
 	err = pci_enable_device(pdev);
 	if (err)
