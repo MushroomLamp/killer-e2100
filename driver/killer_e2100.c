@@ -50,6 +50,9 @@
 
 /* ---- card address map ---- */
 #define CCSR_SPRIDR   0x108
+#define CCSR_SPCR     0x110    /* system priority: bits 18-23 = eTSEC data/BD/emergency CSB priority */
+#define SPCR_TSEC_PRIO(p) ((((p) & 3) << 13) | (((p) & 3) << 11) | (((p) & 3) << 9))
+#define SPCR_TSEC_MASK    SPCR_TSEC_PRIO(3)
 #define PEX_CSB_CTRL  0x9808   /* LE. bit2 WDMAE, bit3 RDMAE, bit1 IBPIOE, bit0 OBPIOE */
 #define PEX_DMA_DSTMR 0x9814
 #define PEX_WDMA_CTRL 0x99a0   /* bit0 START, bit1 SUS */
@@ -207,6 +210,21 @@ MODULE_PARM_DESC(gigabit, "advertise 1000BASE-T (default 0)");
 static int flowctrl = 1;
 module_param(flowctrl, int, 0444);
 MODULE_PARM_DESC(flowctrl, "advertise and use 802.3x PAUSE flow control (default 1)");
+
+/* frames per WDMA chain: shorter chains = shorter bursts of card-memory reads */
+static int rx_batch = BATCH;
+module_param(rx_batch, int, 0444);
+MODULE_PARM_DESC(rx_batch, "max frames per write-DMA chain (1..64, default 64)");
+
+/*
+ * CSB arbitration priority for the eTSEC (0..3). The PCIe block's DMA engine
+ * requests the bus at level 0 with many reads in flight; at level 0 the MAC
+ * loses the round-robin and its RX FIFO overruns while it waits to write
+ * frames into DDR. Level 3 makes the arbiter serve the MAC first.
+ */
+static int etsec_prio = 3;
+module_param(etsec_prio, int, 0444);
+MODULE_PARM_DESC(etsec_prio, "eTSEC bus priority 0..3 (default 3, highest)");
 
 static int spin_us = 40;
 module_param(spin_us, int, 0444);
@@ -477,6 +495,8 @@ static void hw_start(struct kl *k)
 	miim_init(k);
 	mutex_unlock(&k->mii_bus->mdio_lock);
 
+	iowrite32be((ioread32be(k->ccsr + CCSR_SPCR) & ~SPCR_TSEC_MASK) | SPCR_TSEC_PRIO(etsec_prio),
+		    k->ccsr + CCSR_SPCR);
 	mac_set_speed(k, k->speed, k->duplex == DUPLEX_FULL);
 	ew(k, FIFO_TX_THR, tx_thr);
 	ew(k, FIFO_RX_PAUSE, rx_pause_on);
@@ -649,7 +669,7 @@ static int rx_batch_start(struct kl *k)
 	int n = 0, slots = 0, i;
 	u32 d = C_DESC_OFF, next_used = 0;
 
-	while (n < BATCH) {
+	while (n < rx_batch) {
 		u32 sl = ioread32be(k->win + C_RXBD_OFF + idx * 8);
 		u16 st = sl >> 16, len = sl & 0xffff;
 
@@ -952,6 +972,7 @@ static int kl_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	BUILD_BUG_ON(AREA_END > OB_SIZE);
 	BUILD_BUG_ON(C_DESC_OFF + (BATCH + 2) * DESC_SZ > C_SEQ_OFF);
 	BUILD_BUG_ON(C_RXBD_OFF + NRX * 8 > C_DESC_OFF);
+	rx_batch = clamp(rx_batch, 1, BATCH);
 
 	err = pci_enable_device(pdev);
 	if (err)
