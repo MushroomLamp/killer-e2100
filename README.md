@@ -72,7 +72,7 @@ so nothing on the card competes for the hardware.
 | TX / RX, DHCP, DNS, browsing | works |
 | Link | 10/100/1000 negotiated by phylib; gigabit is the default |
 | Receive at gigabit | **lossless**: in a 14k-frame TCP download the MAC counted 13,919 frames and the driver delivered 13,919; MAC-internal loopback runs at 987 Mbit into card DDR with zero overruns |
-| Throughput | 497 Mbit/s on a single TCP stream from a nearby server (a 20 MB transfer, so it includes the handshake and slow start: a floor). v0.2 managed 300; v0.1 15 |
+| Throughput | **844 Mbit/s down, 95 up on a browser speedtest**, which is the ISP's cap on this line (a desktop on the same switch gets the same). Single TCP stream from a nearby server: 497 Mbit/s on a 20 MB transfer including slow start. For comparison: v0.2 316, v0.1 15.7, same port |
 | MAC address | **locally administered placeholder** (`02:4b:49:4c:4c:52`). The real one is in the card's I2C EEPROM; reading it is in progress |
 | ethtool | link settings via phylib, drvinfo |
 | Jumbo frames, checksum offload, WoL | no |
@@ -160,8 +160,8 @@ deliberately not included here. `flash-dump.sh` will read your own card's copy.
 ## Credits
 
 Written by Mitch, with Claude (Anthropic) doing the register-level archaeology,
-in one afternoon in September 2026, starting from "I don't see my NIC listed, do we
-need drivers?"
+in one day in September 2026, starting from "I don't see my NIC listed, do we need
+drivers?" and ending at the ISP's speed cap.
 
 Reference material: NXP MPC8308 Reference Manual; u-boot `immap_83xx.h` and
 `arch/powerpc/cpu/mpc83xx/pcie.c` for the PCIe block layout; the Linux `gianfar`
