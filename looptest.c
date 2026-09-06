@@ -1,6 +1,6 @@
-// looptest — can the eTSEC receive full-size frames at gigabit line rate into
+// looptest - can the eTSEC receive full-size frames at gigabit line rate into
 // the card's DDR at all? MAC-internal loopback: everything the MAC transmits
-// comes straight back into its receiver at wire speed, nothing touches the
+// comes straight back into its receiver at wire speed. Nothing reaches the
 // PHY. TX and RX rings and buffers all live in card DDR; no PCIe DMA engine,
 // no host memory. The host only re-arms descriptors through BAR1.
 // The MAC never sends a truncated frame, so any RX descriptor with the OV bit

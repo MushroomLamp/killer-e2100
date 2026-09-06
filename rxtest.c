@@ -1,4 +1,4 @@
-// rxtest — receive frames on the Killer E2100 by driving eTSEC1 from the
+// rxtest - receive frames on the Killer E2100 by driving eTSEC1 from the
 // host, with the RX ring and buffers in CARD DDR (via BAR1 -> 0x04000000).
 // Optionally transmits the same ARP request as txtest first, so the host's
 // own wifi stack answers it and the reply comes back in on this port.

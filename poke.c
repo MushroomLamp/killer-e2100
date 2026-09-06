@@ -1,4 +1,4 @@
-// poke — a single 32-bit read or write into a PCI BAR via sysfs, with the
+// poke - a single 32-bit read or write into a PCI BAR via sysfs, with the
 // byte order stated explicitly every time. The MPC8308's CCSR is big-endian
 // EXCEPT the PCI Express block (CCSR+0x9000..0x9FFF), which is little-endian.
 // Plain memory targets (DDR, flash) are byte-order neutral.

@@ -1,4 +1,4 @@
-// txtest — send ONE ethernet frame from the Killer E2100 by driving its
+// txtest - send ONE ethernet frame from the Killer E2100 by driving its
 // eTSEC1 MAC directly from the host.
 //
 // Everything the MAC's DMA engine touches lives in the CARD's DDR, reached

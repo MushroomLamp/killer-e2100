@@ -1,96 +1,92 @@
 # Linux driver for the Bigfoot Killer E2100
 
-A working Linux network driver for the **Bigfoot Networks Killer E2100** (also sold as
-Killer 2100 / Killer Xeno Pro), the gaming NIC found on-board the Gigabyte G1.Sniper
-series and on PCIe cards. Bigfoot only ever shipped Windows drivers, and the card is
-not a normal NIC, so no Linux driver has existed since it launched in 2010.
+Linux network driver for the Bigfoot Networks Killer E2100 (also sold as Killer 2100
+and Killer Xeno Pro). Found on-board the Gigabyte G1.Sniper series and on PCIe cards.
+Bigfoot only shipped Windows drivers. This driver gives the card a normal Linux
+network interface.
 
-This one drives the card's ethernet MAC directly and gives you an ordinary `enp7s0`
-that NetworkManager, DHCP and everything else treat like any wired port.
+## Status
 
-## What the card actually is
+| | |
+|---|---|
+| Link | 10/100/1000, negotiated by phylib. Gigabit is the default. |
+| Receive at gigabit | Lossless. In a 14k-frame TCP download the MAC counted 13,919 frames and the driver delivered 13,919. MAC loopback runs at 987 Mbit/s into card DDR with zero overruns. |
+| Throughput | Browser speedtest: 844 Mbit/s down, 95 up, which is the ISP cap on the test line. Single TCP stream from a nearby server: 497 Mbit/s on a 20 MB transfer including slow start. Earlier versions on the same port: v0.2 316 Mbit/s, v0.1 15.7 Mbit/s. |
+| Transmit | Host PIO into a 20-entry ring in card DDR. Fine for a home uplink. Expect roughly 300 to 400 Mbit/s maximum. |
+| MAC address | Placeholder `02:4b:49:4c:4c:52`. The on-board variant tested has no readable EEPROM. Set your own with `ip link set` or NetworkManager if needed. |
+| ethtool | Link settings via phylib, driver info, `-S` statistics. |
+| Jumbo frames, checksum offload, WoL | No. |
+| Bigfoot features (UDP offload, traffic shaping) | No. The card's CPU is not used. |
 
-The E2100 is not an ethernet controller. It is a **Freescale MPC8308 PowerPC SoC**
-with 128 MB of DDR2 and 8 MB of flash, sitting on PCIe as an endpoint. It enumerates
-with PCI class `0b20` ("Power PC"), not `0200` ("Ethernet"), which is why nothing
-binds to it:
+Tested on: Gigabyte G1.Sniper 2 (Z68, on-board E2100), Linux Mint 22.3, kernel 7.0.
+
+## What the card is
+
+The E2100 is not an ethernet controller. It is a Freescale MPC8308 PowerPC SoC with
+128 MB DDR2 and 8 MB flash on a PCIe x1 link. It enumerates with PCI class `0b20`
+(PowerPC), so no ethernet driver binds to it:
 
 ```
 07:00.0 Power PC: Freescale Semiconductor Inc MPC8308 (rev 10)
         Subsystem: Rivet Networks Bigfoot Killer E2100 Gigabit Ethernet Controller
 ```
 
-Bigfoot's design ran Linux 2.6.31 *on the card* with a proprietary module that
-spoke a mailbox-and-DMA protocol to the Windows driver, and offloaded UDP game
-traffic onto the card's own CPU.
+Bigfoot's firmware ran Linux 2.6.31 on the card with a proprietary module that spoke a
+mailbox and DMA protocol to the Windows driver. On the boards examined, the card's
+firmware never boots past u-boot.
 
-The key discovery behind this driver: **BAR0 is the SoC's 1 MB CCSR register
-window.** Every peripheral register in the MPC8308 is reachable from the host,
-including the eTSEC gigabit MAC, the MDIO block, the PCIe address translation
-units, the I2C controller, and the DDR controller. The MPC8308 is fully
-documented public silicon. So instead of reverse-engineering Bigfoot's protocol,
-the host simply programs the MAC itself, exactly the way the card's own kernel
-would have. On the boards examined, the card's firmware never boots past u-boot,
-so nothing on the card competes for the hardware.
+BAR0 is the SoC's 1 MB CCSR register window. Every peripheral in the MPC8308 is
+reachable from the host through it: the eTSEC gigabit MAC, MDIO, the PCIe address
+translation units, I2C, the DDR controller. The MPC8308 is documented public silicon,
+so the driver programs the MAC directly instead of reverse engineering Bigfoot's
+protocol.
 
 ## How it works
 
-* **BAR0** maps the CCSR. Registers are big-endian, except the PCIe controller
-  block at `0x9000`, which is little-endian.
-* The **eTSEC1** MAC at CCSR+`0x24000` is driven with the same register sequences
-  as the in-tree `gianfar` driver.
-* The **Marvell 88E1116R** PHY at MDIO address 1 is handled by phylib, in
-  `RGMII_ID` mode (the board straps both clock delays into the PHY).
-* **Receive**: the MAC's ring and buffers live in the card's own DDR, which it
-  fills at wire speed. Each NAPI poll gathers the frames that arrived, builds a
-  descriptor chain for the PCIe block's write-DMA engine, and starts it once. The
-  engine streams the frames into a 1 MB coherent region in host RAM as full
-  128-byte PCIe writes; a final marker descriptor copies a sequence number after
-  the data, and because PCIe posted writes are ordered, seeing it guarantees every
-  frame before it has landed. The SoC's PCIe outbound window 1 maps card-local
-  `0xB0000000` onto that region and nothing else, so the card cannot address any
-  other host memory. That matters because many boards this card ships on (Sandy
-  Bridge era) have no IOMMU.
-* **Transmit**: the ring and frames also live in card DDR; the host writes them
-  through BAR1. This is not for speed, it is for receive: if the MAC has to read
-  its transmit descriptors across PCIe, those reads queue behind the write-DMA
-  engine's posted writes (PCIe ordering), the MAC's single DMA unit stalls, and
-  its receive FIFO overruns. Keeping every MAC access on the card side was the
-  change that took receive from ~20% loss to zero at gigabit.
-* **Bus tuning**: the card's u-boot leaves the internal bus arbiter at a pipeline
-  depth of one outstanding transaction; the driver sets four, as Freescale's own
-  boards do.
-* **No interrupts**: the MAC's IRQ lines terminate in the card's own interrupt
-  controller, which the host cannot see. NAPI is driven by an hrtimer (default
-  500 µs, `poll_us=` module parameter). Ping RTT to the gateway is ~0.6 ms.
+* BAR0 maps the CCSR. Registers are big-endian, except the PCIe controller block at
+  offset `0x9000`, which is little-endian.
+* The eTSEC1 MAC at CCSR+`0x24000` is programmed with the same register sequences as
+  the in-tree `gianfar` driver.
+* The Marvell 88E1116R PHY at MDIO address 1 is handled by phylib in `RGMII_ID` mode.
+  The board straps both RGMII clock delays into the PHY.
+* Receive: the MAC's ring and buffers are in card DDR. Each NAPI poll collects the
+  frames that arrived, builds a descriptor chain for the PCIe block's write-DMA
+  engine, and starts it once. The engine writes the frames into a 1 MB coherent
+  region in host RAM as 128-byte PCIe writes. A final marker descriptor copies a
+  sequence number after the data. PCIe posted writes are ordered, so when the marker
+  is visible all frames before it have landed. The SoC's PCIe outbound window 1 maps
+  card address `0xB0000000` onto that 1 MB region only, so the card cannot write
+  anywhere else in host memory. Many boards this card ships on have no IOMMU, so
+  this bound matters.
+* Transmit: the ring and frames are also in card DDR. The host writes them through
+  BAR1. Reason: if the MAC reads its transmit descriptors across PCIe, those reads
+  queue behind the write-DMA engine's posted writes (PCIe ordering rules). The MAC has
+  one DMA unit for both directions, so receive stalls and the RX FIFO overruns.
+  Keeping every MAC access on the card side took receive loss from about 20% to zero
+  at gigabit.
+* Bus: the card's u-boot leaves the internal bus arbiter at one outstanding
+  transaction. The driver sets four (`pipe_dep`), as Freescale's reference boards do.
+* Interrupts: the MAC's IRQ lines go to the card's own interrupt controller, which
+  the host cannot see. NAPI is driven by an hrtimer, default 500 µs (`poll_us`).
+  Ping RTT to a gateway is about 0.6 ms.
 
-## Status
+## Module parameters
 
-| | |
-|---|---|
-| Link, autoneg, 10/100/1000 | works (phylib + Marvell driver) |
-| TX / RX, DHCP, DNS, browsing | works |
-| Link | 10/100/1000 negotiated by phylib; gigabit is the default |
-| Receive at gigabit | **lossless**: in a 14k-frame TCP download the MAC counted 13,919 frames and the driver delivered 13,919; MAC-internal loopback runs at 987 Mbit into card DDR with zero overruns |
-| Throughput | **844 Mbit/s down, 95 up on a browser speedtest**, which is the ISP's cap on this line (a desktop on the same switch gets the same). Single TCP stream from a nearby server: 497 Mbit/s on a 20 MB transfer including slow start. For comparison: v0.2 316, v0.1 15.7, same port |
-| MAC address | **locally administered placeholder** (`02:4b:49:4c:4c:52`). The real one is in the card's I2C EEPROM; reading it is in progress |
-| ethtool | link settings via phylib, drvinfo |
-| Jumbo frames, checksum offload, WoL | no |
-| Bigfoot's UDP offload / "Killer" features | never; the card's CPU is not used at all |
+| parameter | default | meaning |
+|---|---|---|
+| `gigabit` | 1 | advertise 1000BASE-T |
+| `poll_us` | 500 | NAPI poll period in microseconds |
+| `tx_thr` | 0x180 | eTSEC transmit FIFO threshold (store-and-forward), 4-byte units |
+| `dmactrl` | 0xc0 | eTSEC DMACTRL value |
+| `flowctrl` | 1 | advertise 802.3x pause |
+| `pipe_dep` | 3 | CSB arbiter pipeline depth field |
+| `etsec_prio` | 3 | eTSEC bus priority 0..3 |
+| `tx_in_card` | 1 | transmit ring in card DDR (1) or host RAM (0) |
+| `dma_chunk` | 512 | bytes per write-DMA descriptor |
+| `rx_batch` | 64 | frames per write-DMA chain |
+| `spin_us` | 40 | wait for a chain in the same poll, microseconds |
 
-### Roadmap
-
-* Transmit is host-PIO into card DDR through a 20-entry ring: plenty for a home
-  uplink, not for a gigabit LAN sender. The PCIe block's read-DMA engine (the twin of
-  the write engine already in use) is the obvious next step.
-* Interrupts: the MAC's IRQs terminate on the card. The PCIe block has inbound and
-  outbound mailbox registers that can raise MSI on the host; using them would replace
-  the 500 µs timer.
-* Real MAC address from the card's EEPROM, where one is populated.
-
-Tested on: Gigabyte G1.Sniper 2 (Z68, on-board E2100), Linux Mint 22.3, kernel 7.0.
-
-## Building and installing
+## Build and install
 
 ```
 cd driver
@@ -99,70 +95,76 @@ sudo ./try.sh             # loads it, waits for DHCP, pings the gateway
 sudo rmmod killer_e2100   # unload
 ```
 
-For a permanent install that survives kernel updates:
+Permanent install with DKMS (rebuilds on kernel updates, loads at boot):
 
 ```
-sudo ./driver/dkms-install.sh          # register with DKMS, build, install, load
+sudo ./driver/dkms-install.sh
 sudo ./driver/dkms-install.sh remove   # undo
 ```
 
-The module is unsigned. On a Secure Boot system you will need to sign it or enroll a
-MOK; legacy-BIOS boards (like the G1.Sniper) do not care.
+The module is unsigned. Secure Boot systems need it signed or a MOK enrolled.
+Legacy BIOS boards do not care.
 
 ## Tools
 
-The `tools` used to reverse-engineer the card, all userspace, all through sysfs BAR
-mmaps. Useful if you have a different board or want to poke at the SoC.
+Userspace tools used to work out the card, all through sysfs BAR mmaps.
 
 | tool | what |
 |---|---|
-| `bar-peek` | read a BAR with strict 32-bit loads; hexdump, strings, raw |
+| `bar-peek` | read a BAR with 32-bit loads: hexdump, strings, raw |
 | `recon.sh` | dump and decode the CCSR: identity, address windows, DDR, PCIe block, both MACs |
-| `mdio` | scan / read / write the PHY, watch link state |
-| `poke` | one 32-bit read or write, byte order stated explicitly |
+| `mdio` | scan, read, write the PHY; watch link state |
+| `poke` | one 32-bit read or write with explicit byte order |
 | `ddr-window.sh` | retarget BAR1 onto the card's DDR |
-| `ddr-dump` | copy a range of the card's DDR to a file |
-| `flash-dump.sh` | dump the 8 MB boot flash (u-boot + Bigfoot's Linux image) via BAR2 |
-| `txtest`, `rxtest` | send / receive frames with rings in card DDR; the proofs the driver grew from |
-| `i2c` | drive the SoC's I2C controller: scan, dump EEPROMs |
+| `ddr-dump` | copy a range of card DDR to a file |
+| `flash-dump.sh` | dump the 8 MB boot flash via BAR2 |
+| `i2c` | drive the SoC's I2C controller: scan, dump |
+| `txtest`, `rxtest` | send and receive frames with rings in card DDR |
+| `looptest` | MAC loopback at line rate into card DDR, reports overruns |
+| `perf.sh` | download, parallel download, upload against Cloudflare, plus counters. `hold` pauses for a browser speedtest |
+| `rxdiag.sh` | flood ping with payload check, kernel TCP counters around a download, MAC vs driver frame counts |
+| `diag.sh`, `tcpdiag.sh`, `tcpcap.sh` | older diagnostics, kept for reference |
 
-`recon-*/` holds the register dumps from the first board this was done on.
+`recon-*/` holds register dumps from the first board this was done on.
 
-### A warning about BAR1
+### Warning about BAR1
 
-On a freshly booted card, **reading BAR1 hangs the PCIe bus** and needs a hard reset.
-Its endpoint translation register points at card address `0xD0000000`, where
-nothing exists, and Sandy Bridge treats the resulting completion timeout as fatal.
-`ddr-window.sh` retargets it to DDR first; the driver does the same at probe. Never
-read BAR1 (or BAR4, which is disabled) blind. BAR2 is the flash and is safe to read
-within its first 8 MB.
+On a freshly booted card, reading BAR1 hangs the PCIe bus and needs a hard reset.
+Its endpoint translation register points at card address `0xD0000000`, where nothing
+exists. Sandy Bridge treats the resulting completion timeout as fatal. `ddr-window.sh`
+retargets BAR1 to DDR first. The driver does the same at probe. Do not read BAR1 or
+BAR4 blind. BAR2 is the flash and is safe to read within its first 8 MB.
 
-## Layout of the card (for the curious)
+## Card layout
 
 | | |
 |---|---|
 | SoC | MPC8308 rev 1.0, core 400 MHz, CSB 133 MHz, big-endian |
-| DDR2 | 128 MB at local `0x0`; the card's own kernel was given 64 MB |
-| Flash | 8 MB 16-bit NOR at `0xF0000000`: HRCW, u-boot, env, Linux uImage (kernel + ext2 ramdisk + FDT) |
-| PCIe | endpoint, x1. Inbound: BAR0→CCSR, BAR1→(void), BAR2→flash, BAR4→disabled. Outbound window 0: `0xA0000000`→host 0 (u-boot's), window 1: ours |
-| MAC | eTSEC1 at CCSR+`0x24000`, RGMII. eTSEC2 unused |
-| PHY | Marvell 88E1116R, MDIO addr 1, both RGMII delays strapped on |
-| Other | I2C at `0x3000` (EEPROM, DS1339 RTC), two 16550 UARTs (probably on test pads), 32 KB local-bus device at `0xE1ED0000` |
+| DDR2 | 128 MB at card address 0. The card's own kernel was given 64 MB. |
+| Flash | 8 MB 16-bit NOR at `0xF0000000`: HRCW, u-boot, env, Linux uImage (kernel, ext2 ramdisk, FDT) |
+| PCIe | endpoint, x1 Gen1. Inbound: BAR0 to CCSR, BAR1 unmapped, BAR2 to flash, BAR4 disabled. Outbound window 0: `0xA0000000` to host 0 (u-boot's). Window 1: this driver's. |
+| Write-DMA engine | PEX bridge at CCSR+`0x9800`. Descriptors are five little-endian words, control word first. Max single descriptor tested: 8192 bytes. Notes in `docs/pex-dma-notes.txt`. |
+| MAC | eTSEC1 at CCSR+`0x24000`, RGMII. eTSEC2 unused. |
+| PHY | Marvell 88E1116R, MDIO address 1, both RGMII delays strapped on |
+| Other | I2C at `0x3000` (nothing answers on the tested board), two 16550 UARTs, 32 KB local-bus device at `0xE1ED0000` |
+
+## Roadmap
+
+* Transmit through the PCIe block's read-DMA engine, for gigabit transmit.
+* MSI through the PCIe block's mailbox registers, to replace the polling timer.
+* MAC address from EEPROM on boards that have one.
 
 ## License
 
-GPL-2.0. The driver is a Linux kernel module and is licensed accordingly; the tools
-are under the same license for simplicity.
+GPL-2.0.
 
-Bigfoot's firmware (the flash image and the files inside it) is their copyright and is
-deliberately not included here. `flash-dump.sh` will read your own card's copy.
+Bigfoot's firmware (the flash image and its contents) is their copyright and is not
+included. `flash-dump.sh` reads your own card's copy.
 
 ## Credits
 
-Written by Mitch, with Claude (Anthropic) doing the register-level archaeology,
-in one day in September 2026, starting from "I don't see my NIC listed, do we need
-drivers?" and ending at the ISP's speed cap.
+Mitch, with Claude (Anthropic), September 2026.
 
-Reference material: NXP MPC8308 Reference Manual; u-boot `immap_83xx.h` and
-`arch/powerpc/cpu/mpc83xx/pcie.c` for the PCIe block layout; the Linux `gianfar`
-and `marvell` drivers.
+References: NXP MPC8308 Reference Manual; u-boot `immap_83xx.h` and
+`arch/powerpc/cpu/mpc83xx/pcie.c` for the PCIe block layout; the Linux `gianfar` and
+`marvell` drivers.

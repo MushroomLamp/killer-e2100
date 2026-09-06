@@ -1,4 +1,4 @@
-// mdio — talk to the PHY behind the Killer E2100's eTSEC through the
+// mdio - talk to the PHY behind the Killer E2100's eTSEC through the
 // MPC8308's MII-management block, from userspace, via BAR0 (CCSR).
 //
 // This is the project's FIRST tool that writes to the device. Every write

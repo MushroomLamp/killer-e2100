@@ -1,4 +1,4 @@
-// i2c — drive the MPC8308's I2C1 controller (CCSR+0x3000) from the host to
+// i2c - drive the MPC8308's I2C1 controller (CCSR+0x3000) from the host to
 // find and read the EEPROM that holds the card's real MAC address.
 // Registers are single bytes: ADR 0x00 FDR 0x04 CR 0x08 SR 0x0C DR 0x10 DFSRR 0x14.
 //

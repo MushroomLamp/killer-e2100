@@ -7,7 +7,7 @@
 # Therefore: BAR0 is known-good, BAR1 is NEVER touched here, and BAR2/BAR4 are
 # opt-in (BAR2=1 / BAR4=1) with BAR2 gated on the DDR controller being enabled.
 #
-# Offsets follow the MPC8308 CCSR map. (v1's labels at 0xA0-0xAC were wrong —
+# Offsets follow the MPC8308 CCSR map. (v1's labels at 0xA0-0xAC were wrong -
 # those are the DDR local access windows; system config lives at 0x100.)
 set -u
 DEV=${DEV:-0000:07:00.0}
@@ -89,7 +89,7 @@ echo
 
 if [ "${BAR2:-0}" = 1 ]; then
 	if [ "$MEMEN" = 1 ]; then
-		echo "==== BAR2 (card DDR) first 64K strings — opt-in, DDR enabled ===="
+		echo "==== BAR2 (card DDR) first 64K strings - opt-in, DDR enabled ===="
 		$BP strings $D/resource2 0 0x10000 8 2>&1 | tee "$OUT/bar2-strings.txt" | head -n 40
 	else
 		echo "==== BAR2 skipped: DDR controller MEM_EN=0, reading it would likely hang ===="
@@ -97,7 +97,7 @@ if [ "${BAR2:-0}" = 1 ]; then
 	echo
 fi
 if [ "${BAR4:-0}" = 1 ]; then
-	echo "==== BAR4 first 4K — opt-in ===="
+	echo "==== BAR4 first 4K - opt-in ===="
 	$BP dump $D/resource4 0 0x1000 be 2>&1 | tee "$OUT/bar4-head.txt" | tail -n 1
 	echo
 fi

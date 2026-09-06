@@ -473,15 +473,15 @@ static int wdma_selftest_order(struct kl *k, int order)
  * Probe the engine with realistic and oversized copies from card DDR
  * (outside the BAR1 window, where the RX buffers live) into the host region.
  * Returns bytes verified, or a negative errno. Also used to find the largest
- * single-descriptor transfer the hardware honours (the manual says 18 bits of
- * words; the silicon disagrees).
+ * single-descriptor transfer the hardware honours (the manual says 18 bits of words;
+ * the hardware limit was measured at 8192 bytes).
  */
 static int wdma_copy_probe(struct kl *k, u32 bytes, u32 piece, u32 seq)
 {
 	u32 *dst = k->area + RXSLOT_OFF, src = C_RXBUF, d = C_DESC_OFF, off = 0, words = bytes / 4;
 	int i;
 
-	/* fill the source through a temporarily retargeted BAR1, and prove the retarget took */
+	/* fill the source through a temporarily retargeted BAR1, and check that the retarget took effect */
 	pw(k, PEX_EPIWTAR1, C_RXBUF | 1);
 	(void)pr(k, PEX_EPIWTAR1);
 	for (i = 0; i < (int)words; i++)

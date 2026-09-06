@@ -1,4 +1,4 @@
-// ddr-dump — copy a range of the CARD's DDR to stdout by sliding the BAR1
+// ddr-dump - copy a range of the CARD's DDR to stdout by sliding the BAR1
 // window (64 KB) across it. Read-only apart from rewriting BAR1's translation
 // register (pex_epiwtar1, CCSR+0x9DE4, little-endian) for each step, exactly
 // the write ddr-window.sh already proved safe. Restores the window to

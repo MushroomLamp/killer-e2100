@@ -46,7 +46,7 @@ echo "==== BAR4 first 4K (16K region, likely message/doorbell unit) ===="
 $BP dump $D/resource4 0 0x1000 2>&1 | tee $OUT/bar4-head.txt | tail -n 1
 echo
 
-echo "==== BAR2 first 1M strings (candidate card DDR — look for u-boot / Linux banners) ===="
+echo "==== BAR2 first 1M strings (candidate card DDR - look for u-boot / Linux banners) ===="
 $BP strings $D/resource2 0 0x100000 8 2>&1 | tee $OUT/bar2-strings.txt | head -n 60
 echo "  ($(wc -l < $OUT/bar2-strings.txt) strings total, full list in $OUT/bar2-strings.txt)"
 echo

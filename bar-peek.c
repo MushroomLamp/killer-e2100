@@ -1,4 +1,4 @@
-// bar-peek — read a PCI BAR through its sysfs resourceN file using strict
+// bar-peek - read a PCI BAR through its sysfs resourceN file using strict
 // 32-bit volatile loads. Never byte accesses (MMIO may reject them), and
 // the mapping is PROT_READ only, so this tool structurally cannot write
 // to the device.

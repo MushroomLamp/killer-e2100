@@ -20,7 +20,7 @@ echo
 echo "retargeting BAR1 -> DDR $TARGET"
 $HERE/poke wr $D/resource0 0x9de4 $(( TARGET | 1 )) le
 echo
-echo "reading BAR1 (first 64 bytes) — this is the read that hung before:"
+echo "reading BAR1 (first 64 bytes) - the read that hung in v1:"
 $HERE/bar-peek dump $D/resource1 0 0x40
 echo
 echo "write a pattern into card DDR through BAR1 and read it back:"
