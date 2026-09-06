@@ -5,23 +5,15 @@
  *
  * The card's own firmware never boots past u-boot, so the host drives the
  * SoC's eTSEC1 ethernet MAC directly through BAR0, which is the SoC's 1 MB
- * CCSR register window (big-endian registers, except the PCIe block at
- * 0x9000 which is little-endian).
+ * CCSR register window (big-endian registers, except the PCIe block which
+ * is little-endian).
  *
- * Data path (v0.3):
- *  TX: descriptor ring and frame buffers live in a 1 MB DMA-coherent region
- *      in host RAM. The SoC's PCIe outbound window 1 maps card-local
- *      0xB0000000..+1MB onto that region, so the MAC's DMA reads frames from
- *      host memory through it (store-and-forward, see FIFO_TX_THR).
- *  RX: the MAC's ring and buffers live in the card's own DDR, which it fills
- *      at wire speed. Each poll gathers the frames that arrived, builds a
- *      chain of descriptors for the PCIe block's write-DMA engine, and starts
- *      it once. The engine streams the frames into the host region as full
- *      128-byte PCIe writes; a final marker descriptor copies a sequence
- *      number to host RAM, and because PCIe posted writes are ordered, seeing
- *      it guarantees every frame before it has landed.
- *  The outbound window is exactly the size of the host region, so the card
- *  cannot address any other host memory: that keeps an IOMMU-less host safe.
+ * Data path: one 1 MB DMA-coherent region in host RAM holds the buffer
+ * descriptor rings and packet buffers. The SoC's PCIe outbound window 1 is
+ * programmed to map card-local 0xB0000000..+1MB onto that region, so the
+ * MAC's DMA engine reads and writes host memory through it. The window is
+ * exactly the size of the region, so the card cannot address any other host
+ * memory: that is what keeps an IOMMU-less host safe.
  *
  * The MAC's interrupts terminate in the card's own interrupt controller, not
  * the host, so NAPI is driven by an hrtimer. The PHY (Marvell 88E1116R) is
@@ -46,44 +38,42 @@
 #include <linux/rtnetlink.h>
 
 #define DRV_NAME "killer_e2100"
-#define DRV_VERSION "0.3"
+#define DRV_VERSION "0.2"
 
 /* ---- card address map ---- */
 #define CCSR_SPRIDR   0x108
-#define PEX_CSB_CTRL  0x9808   /* LE. bit2 WDMAE, bit3 RDMAE, bit1 IBPIOE, bit0 OBPIOE */
-#define PEX_DMA_DSTMR 0x9814
-#define PEX_WDMA_CTRL 0x99a0   /* bit0 START, bit1 SUS */
-#define PEX_WDMA_ADDR 0x99a4   /* CSB address of the first descriptor */
-#define PEX_WDMA_STAT 0x99a8   /* w1c: bit0 CHCPL bit1 DSCPL bit2 DSFER bit4 DSUER bit5 BRER bit6 DAFER */
-#define PEX_OWAR1     0x9cb0   /* outbound window 1: ar, bar, tarl, tarh */
-#define PEX_EPIWTAR1  0x9de4   /* BAR1 -> card DDR */
+#define PEX_EPIWTAR1  0x9de4   /* BAR1 -> card DDR, kept for the debug tools */
+#define PEX_OWAR1     0x9cb0   /* outbound window 1: ar, bar, tarl, tarh (LE) */
 #define DDR_WIN       0x04000000u
 #define OB_BAR        0xB0000000u
 #define OB_SIZE       0x100000u
 #define OWAR_EN       0x1u
 #define OWAR_TYPE_MEM 0x4u
-#define WDMA_START    0x1u
-#define CSB_WDMAE     0x4u
 #define ETSEC         0x24000u
-
-/* WDMA descriptor: five little-endian words. Control word: */
-#define DESC_VALID    0x1u
-#define DESC_NEXT_OK  0x2u
-#define DESC_FBE(x)   ((x) << 4)
-#define DESC_LBE(x)   ((x) << 8)
-#define DESC_LEN(dw)  ((dw) << 12)
-#define DESC_DONE     0x1u                  /* status word */
 
 /* ---- eTSEC registers ---- */
 #define IEVENT 0x010
 #define IMASK 0x014
 #define ECNTRL 0x020
-#define DMACTRL 0x02c
 #define FIFO_RX_PAUSE 0x050
 #define FIFO_RX_PAUSE_SHUTOFF 0x054
 #define FIFO_RX_ALARM 0x058
 #define FIFO_RX_ALARM_SHUTOFF 0x05c
 #define FIFO_TX_THR 0x08c
+#define RMON_RBYT 0x69c
+#define RMON_RPKT 0x6a0
+#define RMON_RFCS 0x6a4
+#define RMON_RUND 0x6cc
+#define RMON_ROVR 0x6d0
+#define RMON_RFRG 0x6d4
+#define RMON_RJBR 0x6d8
+#define RMON_RDRP 0x6dc
+#define RMON_TBYT 0x6e0
+#define RMON_TPKT 0x6e4
+#define RMON_TDRP 0x714
+#define RMON_TFCS 0x71c
+#define RMON_TUND 0x728
+#define DMACTRL 0x02c
 #define TSTAT 0x104
 #define TQUEUE 0x114
 #define TBASEH 0x200
@@ -105,28 +95,19 @@
 #define MIIMIND 0x534
 #define MACSTNADDR1 0x540
 #define MACSTNADDR2 0x544
-#define RMON_RBYT 0x69c
-#define RMON_RPKT 0x6a0
-#define RMON_RFCS 0x6a4
-#define RMON_RUND 0x6cc
-#define RMON_ROVR 0x6d0
-#define RMON_RFRG 0x6d4
-#define RMON_RJBR 0x6d8
-#define RMON_RDRP 0x6dc
-#define RMON_TBYT 0x6e0
-#define RMON_TPKT 0x6e4
-#define RMON_TDRP 0x714
-#define RMON_TFCS 0x71c
-#define RMON_TUND 0x728
 #define GADDR0 0x880
 
 #define MACCFG1_SOFT_RESET 0x80000000u
-#define MACCFG1_RX_FLOW 0x20u
-#define MACCFG1_TX_FLOW 0x10u
 #define MACCFG1_RX_EN 0x4u
 #define MACCFG1_TX_EN 0x1u
+#define MACCFG1_RX_FLOW 0x20u   /* act on received PAUSE frames */
+#define MACCFG1_TX_FLOW 0x10u   /* send PAUSE frames when the RX FIFO fills */
 #define ECNTRL_STEN 0x1000u
 #define ECNTRL_R100 0x8u
+#define DMACTRL_TDSEN 0x80u
+#define DMACTRL_TBDSEN 0x40u
+#define DMACTRL_WWR 0x2u     /* wait for a response to every write: deadly over PCIe */
+#define DMACTRL_WOP 0x1u
 #define DMACTRL_GRS 0x10u
 #define DMACTRL_GTS 0x8u
 #define TSTAT_THLT0 0x80000000u
@@ -136,10 +117,10 @@
 #define RCTRL_PROM 0x8u
 #define IEVENT_GRSC 0x100u
 #define IEVENT_GTSC 0x02000000u
-#define IEVENT_BSY 0x20000000u
-#define IEVENT_EBERR 0x10000000u
+#define IEVENT_BSY 0x20000000u        /* RX: no free buffer, frame dropped */
+#define IEVENT_EBERR 0x10000000u      /* DMA bus error: the card could not reach host RAM */
 #define IEVENT_TXE 0x00400000u
-#define IEVENT_XFUN 0x00010000u
+#define IEVENT_XFUN 0x00010000u       /* TX FIFO underrun */
 #define IEVENT_ERRS (IEVENT_BSY | IEVENT_EBERR | IEVENT_TXE | IEVENT_XFUN)
 #define MIIMIND_BUSY 0x1u
 #define MIIMIND_NOTVALID 0x4u
@@ -162,25 +143,15 @@
 
 #define PHY_ADDR 1
 
-/* ---- host DMA region (card-local OB_BAR + off) ---- */
+/* ---- layout of the DMA region ---- */
 #define NTX 64
+#define NRX 128
 #define BUFSZ 2048
-#define BATCH 64                                     /* frames per WDMA chain = NAPI budget */
 #define TXBD_OFF 0x0000
+#define RXBD_OFF 0x1000
 #define TXBUF_OFF 0x2000
-#define RXSLOT_OFF (TXBUF_OFF + NTX * BUFSZ)         /* BATCH x 2 KB */
-#define MARKER_OFF (RXSLOT_OFF + BATCH * BUFSZ)
-#define HSCR_OFF (MARKER_OFF + 0x1000)               /* self-test scratch */
-#define AREA_END (HSCR_OFF + 0x1000)
-
-/* ---- card DDR through BAR1 (card-local DDR_WIN + off, 64 KB) ---- */
-#define NRX 256
-#define C_RXBD_OFF 0x0000                            /* NRX x 8 */
-#define C_DESC_OFF 0x1000                            /* (BATCH + 2) x 32 */
-#define C_SEQ_OFF  0x3000
-#define C_SCR_OFF  0x3800                            /* self-test pattern, 256 B */
-#define DESC_SZ 32
-#define C_RXBUF (DDR_WIN + 0x100000)                 /* NRX x 2 KB, not host-visible */
+#define RXBUF_OFF (TXBUF_OFF + NTX * BUFSZ)
+#define AREA_END (RXBUF_OFF + NRX * BUFSZ)
 
 struct bd {
 	__be16 status;
@@ -192,26 +163,43 @@ static int poll_us = 500;
 module_param(poll_us, int, 0444);
 MODULE_PARM_DESC(poll_us, "NAPI poll period in microseconds (the MAC has no host IRQ)");
 
+/*
+ * Transmit FIFO threshold. The MAC starts putting a frame on the wire once
+ * this much of it is in its FIFO, then must be fed at line rate. Our frames
+ * are fetched from host RAM over PCIe, which cannot keep up with 1 Gbit/s
+ * read-by-read, so we make it wait for (almost) the whole frame:
+ * store-and-forward. 4-byte units.
+ */
 static int tx_thr = 0x180;
 module_param(tx_thr, int, 0444);
-MODULE_PARM_DESC(tx_thr, "eTSEC FIFO_TX_THR: store-and-forward threshold, 4-byte units");
+MODULE_PARM_DESC(tx_thr, "eTSEC FIFO_TX_THR value (4-byte units)");
 
+/*
+ * DMACTRL. gianfar uses 0xc3 = TDSEN|TBDSEN|WWR|WOP. WWR makes the DMA wait
+ * for a bus response to every write burst, which over PCIe means a full
+ * round trip per 32 bytes: far too slow to drain the RX FIFO at gigabit.
+ * PCIe posted writes are ordered anyway, so drop WWR and WOP.
+ */
 static int dmactrl = 0xc0;
 module_param(dmactrl, int, 0444);
-MODULE_PARM_DESC(dmactrl, "eTSEC DMACTRL (default 0xc0: TDSEN|TBDSEN)");
+MODULE_PARM_DESC(dmactrl, "eTSEC DMACTRL value (default 0xc0: TDSEN|TBDSEN, no WWR/WOP)");
 
+/*
+ * Gigabit RX cannot be sustained by the eTSEC DMA writing straight into host
+ * RAM: the SoC bus bursts 32 bytes, i.e. one small TLP per burst on a x1
+ * Gen1 link, which drains the RX FIFO at about wire speed with no margin.
+ * Until frames are staged in card DDR and moved by the PCIe DMA engine
+ * (planned), default to 100 Mbit, which this path handles with zero loss.
+ */
 static int gigabit;
 module_param(gigabit, int, 0444);
-MODULE_PARM_DESC(gigabit, "advertise 1000BASE-T (default 0)");
+MODULE_PARM_DESC(gigabit, "advertise 1000BASE-T (default 0: 100 Mbit, see driver notes)");
 
 static int flowctrl = 1;
 module_param(flowctrl, int, 0444);
 MODULE_PARM_DESC(flowctrl, "advertise and use 802.3x PAUSE flow control (default 1)");
 
-static int spin_us = 40;
-module_param(spin_us, int, 0444);
-MODULE_PARM_DESC(spin_us, "after starting a WDMA chain, wait up to this long for it in the same poll");
-
+/* RX FIFO pause/alarm thresholds, 4-byte units, 2 KB FIFO */
 static int rx_pause_on = 0x140, rx_pause_off = 0x0c0, rx_alarm_on = 0x100, rx_alarm_off = 0x080;
 module_param(rx_pause_on, int, 0444);
 module_param(rx_pause_off, int, 0444);
@@ -221,10 +209,10 @@ module_param(rx_alarm_off, int, 0444);
 struct kl {
 	struct pci_dev *pdev;
 	struct net_device *ndev;
-	void __iomem *ccsr, *win;
+	void __iomem *ccsr;
 	void *area;
 	dma_addr_t area_dma;
-	struct bd *txbd;
+	struct bd *txbd, *rxbd;
 	struct mii_bus *mii_bus;
 	struct napi_struct napi;
 	struct hrtimer timer;
@@ -233,29 +221,14 @@ struct kl {
 	spinlock_t tx_lock;
 	unsigned int tx_head, tx_tail, tx_count, rx_cur;
 	int speed, duplex;
-	/* WDMA */
-	int desc_order;                   /* 0 = next pointer first in memory, 1 = control first */
-	u32 seq;
-	struct {
-		bool active;
-		int n;
-		u32 seq;
-		unsigned long started;
-		u16 idx[BATCH], len[BATCH], st[BATCH];
-		s8 slot[BATCH];
-	} batch;
 	u64 bd_tr, bd_ov, bd_cr, bd_sh, bd_no, bd_lg, bd_frag;
 	u64 ev_xfun, ev_txe, ev_bsy, ev_eberr;
-	u64 wdma_chains, wdma_timeouts, wdma_errors;
 };
 
 static inline u32 er(struct kl *k, u32 r) { return ioread32be(k->ccsr + ETSEC + r); }
 static inline void ew(struct kl *k, u32 r, u32 v) { iowrite32be(v, k->ccsr + ETSEC + r); }
-static inline u32 pr(struct kl *k, u32 r) { return ioread32(k->ccsr + r); }          /* PCIe block, LE */
-static inline void pw(struct kl *k, u32 r, u32 v) { iowrite32(v, k->ccsr + r); }
 static inline u8 *txbuf(struct kl *k, unsigned int i) { return k->area + TXBUF_OFF + i * BUFSZ; }
-static inline u8 *rxslot(struct kl *k, unsigned int i) { return k->area + RXSLOT_OFF + i * BUFSZ; }
-static inline u32 *marker(struct kl *k) { return k->area + MARKER_OFF; }
+static inline u8 *rxbuf(struct kl *k, unsigned int i) { return k->area + RXBUF_OFF + i * BUFSZ; }
 
 /* ---------------- MDIO (process context only) ---------------- */
 static int miim_wait(struct kl *k, u32 mask)
@@ -293,100 +266,6 @@ static int kl_mdio_write(struct mii_bus *bus, int addr, int reg, u16 val)
 	ew(k, MIIMADD, (addr << 8) | reg);
 	ew(k, MIIMCON, val);
 	return miim_wait(k, MIIMIND_BUSY);
-}
-
-/* ---------------- WDMA ---------------- */
-/*
- * Write one descriptor at card offset `off` (inside the BAR1 window).
- * Words are little-endian. The word carrying VALID is written last.
- */
-static void wdma_desc(struct kl *k, u32 off, u32 src, u32 dst, u32 len_dw, u32 next_card)
-{
-	void __iomem *d = k->win + off;
-	u32 ctrl = DESC_LEN(len_dw) | DESC_LBE(0xf) | DESC_FBE(0xf) | DESC_NEXT_OK | DESC_VALID;
-
-	if (k->desc_order == 0) {           /* next, dst, src, status, control */
-		iowrite32(next_card, d + 0);
-		iowrite32(dst, d + 4);
-		iowrite32(src, d + 8);
-		iowrite32(0, d + 12);
-		iowrite32(ctrl, d + 16);
-	} else {                            /* control, status, src, dst, next */
-		iowrite32(0, d + 4);
-		iowrite32(src, d + 8);
-		iowrite32(dst, d + 12);
-		iowrite32(next_card, d + 16);
-		iowrite32(ctrl, d + 0);
-	}
-}
-
-static void wdma_desc_null(struct kl *k, u32 off)
-{
-	int i;
-	for (i = 0; i < DESC_SZ; i += 4)
-		iowrite32(0, k->win + off + i);
-}
-
-static void wdma_kick(struct kl *k, u32 first_card, u32 seq)
-{
-	iowrite32(seq, k->win + C_SEQ_OFF);          /* what the marker descriptor will copy */
-	(void)ioread32(k->win + C_SEQ_OFF);          /* flush posted writes into card DDR */
-	pw(k, PEX_WDMA_STAT, 0x7f);
-	pw(k, PEX_WDMA_ADDR, first_card);
-	pw(k, PEX_WDMA_CTRL, WDMA_START);
-}
-
-/* returns 0 on success, -EIO if the engine did not deliver the marker */
-static int wdma_selftest_order(struct kl *k, int order)
-{
-	u32 *hscr = k->area + HSCR_OFF;
-	u32 seq = 0xC0DE0000u | order, d0 = C_DESC_OFF, d1 = d0 + DESC_SZ, d2 = d1 + DESC_SZ;
-	int i;
-
-	k->desc_order = order;
-	for (i = 0; i < 64; i++)
-		iowrite32(0x11111111u * (i + 1) ^ order, k->win + C_SCR_OFF + i * 4);
-	memset(hscr, 0, 256);
-	WRITE_ONCE(*marker(k), 0);
-	wmb();
-	wdma_desc(k, d0, DDR_WIN + C_SCR_OFF, OB_BAR + HSCR_OFF, 64, DDR_WIN + d1);
-	wdma_desc(k, d1, DDR_WIN + C_SEQ_OFF, OB_BAR + MARKER_OFF, 1, 0);
-	wdma_desc_null(k, d2);
-	wdma_kick(k, DDR_WIN + d0, seq);
-	for (i = 0; i < 5000; i++) {
-		if (READ_ONCE(*marker(k)) == seq)
-			break;
-		udelay(1);
-	}
-	if (READ_ONCE(*marker(k)) != seq) {
-		dev_info(&k->pdev->dev, "wdma selftest order %d: no marker (stat %08x, ctrl %08x)\n",
-			 order, pr(k, PEX_WDMA_STAT), pr(k, PEX_WDMA_CTRL));
-		return -EIO;
-	}
-	for (i = 0; i < 64; i++)
-		if (hscr[i] != (0x11111111u * (i + 1) ^ order)) {
-			dev_info(&k->pdev->dev, "wdma selftest order %d: marker ok but data wrong at %d (%08x)\n",
-				 order, i, hscr[i]);
-			return -EIO;
-		}
-	return 0;
-}
-
-static int wdma_selftest(struct kl *k)
-{
-	int order;
-
-	pw(k, PEX_CSB_CTRL, pr(k, PEX_CSB_CTRL) | CSB_WDMAE);
-	pw(k, PEX_DMA_DSTMR, 0x100);
-	for (order = 0; order < 2; order++) {
-		if (!wdma_selftest_order(k, order)) {
-			dev_info(&k->pdev->dev, "wdma selftest passed: descriptor order %d (%s)\n",
-				 order, order ? "control word first" : "next pointer first");
-			return 0;
-		}
-		pw(k, PEX_WDMA_STAT, 0x7f);
-	}
-	return -EIO;
 }
 
 /* ---------------- MAC ---------------- */
@@ -430,14 +309,12 @@ static void rings_init(struct kl *k)
 		k->txbd[i].status = cpu_to_be16(i == NTX - 1 ? TXBD_WRAP : 0);
 	}
 	for (i = 0; i < NRX; i++) {
-		void __iomem *bd = k->win + C_RXBD_OFF + i * 8;
-		iowrite32be(C_RXBUF + i * BUFSZ, bd + 4);
-		iowrite16be(0, bd + 2);
-		iowrite16be(RXBD_EMPTY | (i == NRX - 1 ? RXBD_WRAP : 0), bd);
+		k->rxbd[i].buf = cpu_to_be32(OB_BAR + RXBUF_OFF + i * BUFSZ);
+		k->rxbd[i].len = 0;
+		k->rxbd[i].status = cpu_to_be16(RXBD_EMPTY | (i == NRX - 1 ? RXBD_WRAP : 0));
 	}
 	k->tx_head = k->tx_tail = k->tx_count = 0;
 	k->rx_cur = 0;
-	k->batch.active = false;
 	dma_wmb();
 }
 
@@ -465,7 +342,7 @@ static void hw_start(struct kl *k)
 	rings_init(k);
 	ew(k, MRBLR, BUFSZ);
 	ew(k, RBASEH, 0);
-	ew(k, RBASE0, DDR_WIN + C_RXBD_OFF);
+	ew(k, RBASE0, OB_BAR + RXBD_OFF);
 	ew(k, TBASEH, 0);
 	ew(k, TBASE0, OB_BAR + TXBD_OFF);
 	ew(k, RQUEUE, RQUEUE_EN0);
@@ -489,11 +366,6 @@ static void hw_stop(struct kl *k)
 	}
 	ew(k, MACCFG1, er(k, MACCFG1) & ~(MACCFG1_RX_EN | MACCFG1_TX_EN));
 	ew(k, IEVENT, 0xffffffffu);
-	/* let any WDMA chain drain, then park the engine */
-	for (i = 0; i < 100 && k->batch.active && READ_ONCE(*marker(k)) != k->batch.seq; i++)
-		udelay(100);
-	k->batch.active = false;
-	pw(k, PEX_WDMA_STAT, 0x7f);
 }
 
 /* ---------------- TX ---------------- */
@@ -525,7 +397,7 @@ static netdev_tx_t kl_xmit(struct sk_buff *skb, struct net_device *ndev)
 	dma_wmb();
 	k->txbd[i].status = cpu_to_be16(TXBD_READY | TXBD_LAST | TXBD_CRC | (i == NTX - 1 ? TXBD_WRAP : 0));
 	wmb();
-	ew(k, TSTAT, TSTAT_THLT0);
+	ew(k, TSTAT, TSTAT_THLT0);            /* wake the TX DMA if it halted on an empty ring */
 	k->tx_head = (i + 1) % NTX;
 	if (++k->tx_count == NTX)
 		netif_stop_queue(ndev);
@@ -553,144 +425,55 @@ static void tx_reap(struct kl *k)
 }
 
 /* ---------------- RX ---------------- */
-static void rx_bd_rearm(struct kl *k, unsigned int idx)
-{
-	iowrite16be(RXBD_EMPTY | (idx == NRX - 1 ? RXBD_WRAP : 0), k->win + C_RXBD_OFF + idx * 8);
-}
-
-static void rx_count_error(struct kl *k, u16 st)
+static int rx_poll(struct kl *k, int budget)
 {
 	struct net_device *ndev = k->ndev;
-	ndev->stats.rx_errors++;
-	if (st & RXBD_CRCERR) { ndev->stats.rx_crc_errors++; k->bd_cr++; }
-	if (st & RXBD_TR) { ndev->stats.rx_fifo_errors++; k->bd_tr++; }
-	if (st & RXBD_OV) { ndev->stats.rx_over_errors++; k->bd_ov++; }
-	if (st & RXBD_SH) { ndev->stats.rx_length_errors++; k->bd_sh++; }
-	if (st & RXBD_LG) { ndev->stats.rx_length_errors++; k->bd_lg++; }
-	if (st & RXBD_NO) { ndev->stats.rx_frame_errors++; k->bd_no++; }
-	if ((st & (RXBD_FIRST | RXBD_LAST)) != (RXBD_FIRST | RXBD_LAST)) k->bd_frag++;
-}
+	int work = 0;
 
-/* the chain finished: hand the frames to the stack and give the card its buffers back */
-static int rx_batch_deliver(struct kl *k)
-{
-	struct net_device *ndev = k->ndev;
-	int i, delivered = 0;
+	while (work < budget) {
+		struct bd *bd = &k->rxbd[k->rx_cur];
+		u16 st = be16_to_cpu(READ_ONCE(bd->status));
+		u16 len;
 
-	for (i = 0; i < k->batch.n; i++) {
-		if (k->batch.slot[i] >= 0) {
-			u16 len = k->batch.len[i] - ETH_FCS_LEN;
-			struct sk_buff *skb = napi_alloc_skb(&k->napi, len);
+		if (st & RXBD_EMPTY)
+			break;
+		dma_rmb();
+		len = be16_to_cpu(bd->len);
+
+		if ((st & RXBD_ERRS) || (st & (RXBD_FIRST | RXBD_LAST)) != (RXBD_FIRST | RXBD_LAST) ||
+		    len < ETH_HLEN + ETH_FCS_LEN || len > BUFSZ) {
+			ndev->stats.rx_errors++;
+			if (st & RXBD_CRCERR) { ndev->stats.rx_crc_errors++; k->bd_cr++; }
+			if (st & RXBD_TR) { ndev->stats.rx_fifo_errors++; k->bd_tr++; }
+			if (st & RXBD_OV) { ndev->stats.rx_over_errors++; k->bd_ov++; }
+			if (st & RXBD_SH) { ndev->stats.rx_length_errors++; k->bd_sh++; }
+			if (st & RXBD_LG) { ndev->stats.rx_length_errors++; k->bd_lg++; }
+			if (st & RXBD_NO) { ndev->stats.rx_frame_errors++; k->bd_no++; }
+			if ((st & (RXBD_FIRST | RXBD_LAST)) != (RXBD_FIRST | RXBD_LAST)) k->bd_frag++;
+			net_warn_ratelimited("%s: bad rx bd status %04x len %u\n", ndev->name, st, len);
+		} else {
+			struct sk_buff *skb;
+			len -= ETH_FCS_LEN;
+			skb = napi_alloc_skb(&k->napi, len);
 			if (!skb) {
 				ndev->stats.rx_dropped++;
 			} else {
-				skb_copy_to_linear_data(skb, rxslot(k, k->batch.slot[i]), len);
+				skb_copy_to_linear_data(skb, rxbuf(k, k->rx_cur), len);
 				skb_put(skb, len);
 				skb->protocol = eth_type_trans(skb, ndev);
 				ndev->stats.rx_packets++;
 				ndev->stats.rx_bytes += len;
 				napi_gro_receive(&k->napi, skb);
-				delivered++;
 			}
 		}
-		rx_bd_rearm(k, k->batch.idx[i]);
+		dma_wmb();
+		WRITE_ONCE(bd->status, cpu_to_be16(RXBD_EMPTY | (k->rx_cur == NRX - 1 ? RXBD_WRAP : 0)));
+		k->rx_cur = (k->rx_cur + 1) % NRX;
+		work++;
 	}
-	k->rx_cur = (k->batch.idx[k->batch.n - 1] + 1) % NRX;
-	k->batch.active = false;
-	wmb();
-	ew(k, RSTAT, RSTAT_RHLT0);
-	return delivered;
-}
-
-static void rx_batch_abort(struct kl *k, const char *why)
-{
-	int i;
-	net_err_ratelimited("%s: wdma %s (stat %08x ctrl %08x), dropping %d frames\n", k->ndev->name, why,
-			    pr(k, PEX_WDMA_STAT), pr(k, PEX_WDMA_CTRL), k->batch.n);
-	pw(k, PEX_WDMA_STAT, 0x7f);
-	for (i = 0; i < k->batch.n; i++)
-		rx_bd_rearm(k, k->batch.idx[i]);
-	k->ndev->stats.rx_dropped += k->batch.n;
-	k->rx_cur = (k->batch.idx[k->batch.n - 1] + 1) % NRX;
-	k->batch.active = false;
-	ew(k, RSTAT, RSTAT_RHLT0);
-}
-
-/* gather frames waiting in card DDR and start a chain moving them to host RAM */
-static int rx_batch_start(struct kl *k)
-{
-	unsigned int idx = k->rx_cur;
-	int n = 0, slots = 0, i;
-	u32 d = C_DESC_OFF, next_used = 0;
-
-	while (n < BATCH) {
-		u32 sl = ioread32be(k->win + C_RXBD_OFF + idx * 8);
-		u16 st = sl >> 16, len = sl & 0xffff;
-
-		if (st & RXBD_EMPTY)
-			break;
-		k->batch.idx[n] = idx;
-		k->batch.st[n] = st;
-		k->batch.len[n] = len;
-		if ((st & RXBD_ERRS) || (st & (RXBD_FIRST | RXBD_LAST)) != (RXBD_FIRST | RXBD_LAST) ||
-		    len < ETH_HLEN + ETH_FCS_LEN || len > BUFSZ) {
-			rx_count_error(k, st);
-			k->batch.slot[n] = -1;
-		} else {
-			k->batch.slot[n] = slots++;
-		}
-		idx = (idx + 1) % NRX;
-		n++;
-	}
-	if (!n)
-		return 0;
-
-	/* one descriptor per good frame, chained in memory order */
-	for (i = 0; i < n; i++) {
-		if (k->batch.slot[i] < 0)
-			continue;
-		wdma_desc(k, d, C_RXBUF + k->batch.idx[i] * BUFSZ,
-			  OB_BAR + RXSLOT_OFF + k->batch.slot[i] * BUFSZ,
-			  DIV_ROUND_UP(k->batch.len[i], 4), DDR_WIN + d + DESC_SZ);
-		d += DESC_SZ;
-		next_used++;
-	}
-	/* marker: copies the sequence word into host RAM after all the data */
-	wdma_desc(k, d, DDR_WIN + C_SEQ_OFF, OB_BAR + MARKER_OFF, 1, 0);
-	wdma_desc_null(k, d + DESC_SZ);
-
-	k->batch.n = n;
-	k->batch.seq = ++k->seq;
-	k->batch.started = jiffies;
-	k->batch.active = true;
-	k->wdma_chains++;
-	wdma_kick(k, DDR_WIN + C_DESC_OFF, k->batch.seq);
-	return n;
-}
-
-static int rx_poll(struct kl *k, int budget)
-{
-	int work = 0, i;
-
-	if (k->batch.active) {
-		if (READ_ONCE(*marker(k)) == k->batch.seq) {
-			work = rx_batch_deliver(k);
-		} else if (time_after(jiffies, k->batch.started + HZ / 20)) {
-			k->wdma_timeouts++;
-			rx_batch_abort(k, "timeout");
-		} else {
-			return 0;                    /* still in flight */
-		}
-	}
-	if (work >= budget)
-		return work;
-	if (!rx_batch_start(k))
-		return work;
-	/* small chains usually land in a few microseconds: deliver them now */
-	for (i = 0; i < spin_us; i++) {
-		if (READ_ONCE(*marker(k)) == k->batch.seq)
-			return work + rx_batch_deliver(k);
-		udelay(1);
+	if (work) {
+		wmb();
+		ew(k, RSTAT, RSTAT_RHLT0);
 	}
 	return work;
 }
@@ -711,7 +494,7 @@ static void check_errors(struct kl *k)
 		net_err_ratelimited("%s: DMA bus error (IEVENT %08x)\n", ndev->name, ev);
 	}
 	if (ev & (IEVENT_TXE | IEVENT_XFUN))
-		ew(k, TSTAT, TSTAT_THLT0);
+		ew(k, TSTAT, TSTAT_THLT0);   /* the TX DMA halts on an underrun; restart it */
 	if (ev & IEVENT_BSY)
 		ew(k, RSTAT, RSTAT_RHLT0);
 }
@@ -799,11 +582,7 @@ static int kl_open(struct net_device *ndev)
 
 	if (!phydev)
 		return -ENODEV;
-	err = wdma_selftest(k);
-	if (err) {
-		netdev_err(ndev, "PCIe write-DMA self-test failed, not opening\n");
-		return err;
-	}
+	/* RGMII_ID: the 88E1116R provides both clock delays on this board */
 	err = phy_connect_direct(ndev, phydev, kl_adjust_link, PHY_INTERFACE_MODE_RGMII_ID);
 	if (err)
 		return err;
@@ -863,7 +642,6 @@ static const char kl_stat_names[][ETH_GSTRING_LEN] = {
 	"mac_tx_packets", "mac_tx_bytes", "mac_tx_dropped", "mac_tx_crc_err", "mac_tx_underrun",
 	"bd_rx_truncated", "bd_rx_overrun", "bd_rx_crc", "bd_rx_short", "bd_rx_nonoctet", "bd_rx_large", "bd_rx_fragmented",
 	"ev_tx_underrun", "ev_tx_error", "ev_rx_busy", "ev_bus_error",
-	"wdma_chains", "wdma_timeouts", "wdma_errors",
 };
 
 static int kl_get_sset_count(struct net_device *ndev, int sset)
@@ -889,7 +667,6 @@ static void kl_get_ethtool_stats(struct net_device *ndev, struct ethtool_stats *
 	data[n++] = k->bd_tr; data[n++] = k->bd_ov; data[n++] = k->bd_cr; data[n++] = k->bd_sh;
 	data[n++] = k->bd_no; data[n++] = k->bd_lg; data[n++] = k->bd_frag;
 	data[n++] = k->ev_xfun; data[n++] = k->ev_txe; data[n++] = k->ev_bsy; data[n++] = k->ev_eberr;
-	data[n++] = k->wdma_chains; data[n++] = k->wdma_timeouts; data[n++] = k->wdma_errors;
 }
 
 static const struct ethtool_ops kl_ethtool_ops = {
@@ -906,13 +683,13 @@ static const struct ethtool_ops kl_ethtool_ops = {
 /* ---------------- PCI ---------------- */
 static void ob_window_set(struct kl *k, bool enable)
 {
-	pw(k, PEX_OWAR1, 0);
+	iowrite32(0, k->ccsr + PEX_OWAR1);
 	if (!enable)
 		return;
-	pw(k, PEX_OWAR1 + 4, OB_BAR);
-	pw(k, PEX_OWAR1 + 8, lower_32_bits(k->area_dma));
-	pw(k, PEX_OWAR1 + 12, upper_32_bits(k->area_dma));
-	pw(k, PEX_OWAR1, OB_SIZE | OWAR_TYPE_MEM | OWAR_EN);
+	iowrite32(OB_BAR, k->ccsr + PEX_OWAR1 + 4);
+	iowrite32(lower_32_bits(k->area_dma), k->ccsr + PEX_OWAR1 + 8);
+	iowrite32(upper_32_bits(k->area_dma), k->ccsr + PEX_OWAR1 + 12);
+	iowrite32(OB_SIZE | OWAR_TYPE_MEM | OWAR_EN, k->ccsr + PEX_OWAR1);
 }
 
 static int kl_probe(struct pci_dev *pdev, const struct pci_device_id *id)
@@ -924,7 +701,6 @@ static int kl_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	static const u8 mac[ETH_ALEN] = { 0x02, 0x4b, 0x49, 0x4c, 0x4c, 0x52 };
 
 	BUILD_BUG_ON(AREA_END > OB_SIZE);
-	BUILD_BUG_ON(C_DESC_OFF + (BATCH + 2) * DESC_SZ > C_SEQ_OFF);
 
 	err = pci_enable_device(pdev);
 	if (err)
@@ -932,8 +708,8 @@ static int kl_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	err = pci_request_regions(pdev, DRV_NAME);
 	if (err)
 		goto out_disable;
-	if (pci_resource_len(pdev, 0) < 0x100000 || pci_resource_len(pdev, 1) < 0x10000) {
-		dev_err(&pdev->dev, "unexpected BAR sizes\n");
+	if (pci_resource_len(pdev, 0) < 0x100000) {
+		dev_err(&pdev->dev, "BAR0 is not the 1 MB CCSR window\n");
 		err = -ENODEV;
 		goto out_release;
 	}
@@ -953,22 +729,14 @@ static int kl_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	SET_NETDEV_DEV(ndev, &pdev->dev);
 
 	k->ccsr = pci_iomap(pdev, 0, 0);
-	k->win = pci_iomap(pdev, 1, 0);
-	if (!k->ccsr || !k->win) {
+	if (!k->ccsr) {
 		err = -EIO;
-		goto out_unmap;
+		goto out_free;
 	}
 	spridr = ioread32be(k->ccsr + CCSR_SPRIDR);
 	if (spridr >> 16 != 0x8101) {
 		dev_err(&pdev->dev, "SPRIDR %08x is not an MPC8308, refusing\n", spridr);
 		err = -ENODEV;
-		goto out_unmap;
-	}
-	/* BAR1 -> card DDR, before anything touches it */
-	pw(k, PEX_EPIWTAR1, DDR_WIN | 1);
-	if (pr(k, PEX_EPIWTAR1) != (DDR_WIN | 1)) {
-		dev_err(&pdev->dev, "could not retarget BAR1\n");
-		err = -EIO;
 		goto out_unmap;
 	}
 
@@ -983,7 +751,9 @@ static int kl_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		goto out_dma;
 	}
 	k->txbd = k->area + TXBD_OFF;
+	k->rxbd = k->area + RXBD_OFF;
 	ob_window_set(k, true);
+	iowrite32(DDR_WIN | 1, k->ccsr + PEX_EPIWTAR1);
 
 	spin_lock_init(&k->tx_lock);
 	INIT_WORK(&k->reset_work, kl_reset_work);
@@ -1019,7 +789,7 @@ static int kl_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	ndev->ethtool_ops = &kl_ethtool_ops;
 	ndev->watchdog_timeo = 5 * HZ;
 	ndev->max_mtu = ETH_DATA_LEN;
-	eth_hw_addr_set(ndev, mac);          /* the on-board variant has no readable EEPROM */
+	eth_hw_addr_set(ndev, mac);          /* TODO: read the real one from the card's EEPROM */
 
 	err = register_netdev(ndev);
 	if (err)
@@ -1037,10 +807,8 @@ out_napi:
 out_dma:
 	dma_free_coherent(&pdev->dev, OB_SIZE, k->area, k->area_dma);
 out_unmap:
-	if (k->win)
-		pci_iounmap(pdev, k->win);
-	if (k->ccsr)
-		pci_iounmap(pdev, k->ccsr);
+	pci_iounmap(pdev, k->ccsr);
+out_free:
 	free_netdev(ndev);
 out_release:
 	pci_release_regions(pdev);
@@ -1060,7 +828,6 @@ static void kl_remove(struct pci_dev *pdev)
 	netif_napi_del(&k->napi);
 	ob_window_set(k, false);           /* the card must lose its view of host RAM first */
 	dma_free_coherent(&pdev->dev, OB_SIZE, k->area, k->area_dma);
-	pci_iounmap(pdev, k->win);
 	pci_iounmap(pdev, k->ccsr);
 	free_netdev(ndev);
 	pci_release_regions(pdev);
