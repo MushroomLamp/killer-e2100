@@ -57,11 +57,24 @@ so nothing on the card competes for the hardware.
 |---|---|
 | Link, autoneg, 10/100/1000 | works (phylib + Marvell driver) |
 | TX / RX, DHCP, DNS, browsing | works |
-| Throughput | v0.1 (PIO): ~95 Mbit up / ~16 Mbit down. v0.2 (DMA): see below |
+| Link | 10/100/1000 negotiated by phylib. **Reliable at 100 Mbit** (zero RX errors under sustained load) |
+| Gigabit | link trains, but sustained RX overruns the MAC FIFO: the eTSEC DMA into host RAM cannot be drained fast enough over the x1 Gen1 link. **Not yet reliable** — opt in with `gigabit=1`. Fixed properly by v0.3 |
 | MAC address | **locally administered placeholder** (`02:4b:49:4c:4c:52`). The real one is in the card's I2C EEPROM; reading it is in progress |
 | ethtool | link settings via phylib, drvinfo |
 | Jumbo frames, checksum offload, WoL | no |
 | Bigfoot's UDP offload / "Killer" features | never; the card's CPU is not used at all |
+
+Default link speed is 100 Mbit (`gigabit=0`), which the current receive path handles
+with no loss. `gigabit=1` raises the ceiling but is not yet reliable under load.
+
+### Roadmap: v0.3, the way Bigfoot did it
+
+The MPC8308's PCI Express block has its own descriptor-based DMA engine (write and
+read), fully documented in the reference manual (chapter 14; notes in
+`docs/pex-dma-notes.txt`). v0.3 will stage frames in the card's own DDR at wire speed
+and move them across the link with that engine instead of pointing the MAC's DMA
+straight at host RAM. That is how the original firmware sustained gigabit, and it
+removes the FIFO-drain bottleneck.
 
 Tested on: Gigabyte G1.Sniper 2 (Z68, on-board E2100), Linux Mint 22.3, kernel 7.0.
 

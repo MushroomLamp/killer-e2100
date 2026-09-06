@@ -184,6 +184,17 @@ static int dmactrl = 0xc0;
 module_param(dmactrl, int, 0444);
 MODULE_PARM_DESC(dmactrl, "eTSEC DMACTRL value (default 0xc0: TDSEN|TBDSEN, no WWR/WOP)");
 
+/*
+ * Gigabit RX cannot be sustained by the eTSEC DMA writing straight into host
+ * RAM: the SoC bus bursts 32 bytes, i.e. one small TLP per burst on a x1
+ * Gen1 link, which drains the RX FIFO at about wire speed with no margin.
+ * Until frames are staged in card DDR and moved by the PCIe DMA engine
+ * (planned), default to 100 Mbit, which this path handles with zero loss.
+ */
+static int gigabit;
+module_param(gigabit, int, 0444);
+MODULE_PARM_DESC(gigabit, "advertise 1000BASE-T (default 0: 100 Mbit, see driver notes)");
+
 static int flowctrl = 1;
 module_param(flowctrl, int, 0444);
 MODULE_PARM_DESC(flowctrl, "advertise and use 802.3x PAUSE flow control (default 1)");
@@ -575,9 +586,13 @@ static int kl_open(struct net_device *ndev)
 	err = phy_connect_direct(ndev, phydev, kl_adjust_link, PHY_INTERFACE_MODE_RGMII_ID);
 	if (err)
 		return err;
-	phy_attached_info(phydev);
+	if (!gigabit) {
+		phy_remove_link_mode(phydev, ETHTOOL_LINK_MODE_1000baseT_Full_BIT);
+		phy_remove_link_mode(phydev, ETHTOOL_LINK_MODE_1000baseT_Half_BIT);
+	}
 	if (flowctrl)
 		phy_support_asym_pause(phydev);
+	phy_attached_info(phydev);
 
 	k->speed = SPEED_1000;
 	k->duplex = DUPLEX_FULL;

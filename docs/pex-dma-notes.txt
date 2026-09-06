@@ -1,0 +1,242 @@
+14.8      DMA Functional Operation
+Software uses the DMA engine to initiate memory transfers from the CSB subsystem to the PCI Express
+system and vice versa without using programmed input/output (PIO), where data is transferred by sending
+control data through the CPU. The DMA engine provides control registers to enable the transfers. The PCI
+Express CSB bridge supports two separate engines for read and write DMA operations, referred as RDMA
+and WDMA, respectively. The DMA engines use a descriptor-based programming model.
+                                                   NOTE
+                In general, the DMA descriptors use little-endian byte ordering. Software
+                running on the local processor in big-endian mode must byte-swap the data.
+                No byte swapping occurs when the registers are accessed from the
+                PCI Express link.
+14.8.1       DMA Descriptor Format
+The DMA descriptor, shown in Figure 14-142, is five DW wide and consists of control and status fields.
+The software is responsible to prepare the descriptors at the local memory and program the relevant DMA
+Freescale Semiconductor                                                                                    14-127
+PCI Express Interface Controller
+control registers. The hardware updates the status register on completion of a DMA data transfer for a
+descriptor and a chain of descriptors, and report errors.
+ Offset Anywhere in local memory                                                                                                        :
+          15                                                                                                                      128
+          9
+     R                                                     Next descriptor pointer
+     W
+ Reset                                                            All zeros
+          12                                                                                                                       96
+          7
+     R                                                      Destination address
+     W
+ Reset                                                            All zeros
+          95                                                                                                                       64
+     R                                                         Source address
+     W
+ Reset                                                            All zeros
+          63                                                                      37     36      35        34           33         32
+     R                                                                                   PCI
+                                                                                               Bridge    CSB        Descriptor
+                                                                                       Express                                   Done
+                                            —                                                   error    error        error
+                                                                                        error
+     W
+ Reset                                                            All zeros
+          31 30 29                                         1 11         8   7             4       3        2            1          0
+                                                           2
+     R                                                                                                 No
+                                                                                               Snoop             Next
+                                                               Last Byte        First Byte            snoop
+                              Transfer length                                                    for          descriptor Valid
+           —                                                    Enable           Enable              for PCI
+                                                                                                CSB          pointer valid
+                                                                                                     Express
+     W
+ Reset                                                            All zeros
+                                          Figure 14-142. DMA Descriptor Format
+Table 14-143 defines the bit fields of a DMA descriptor.
+                                   Table 14-143. DMA Descriptor Bit Fields Description
+   Bits        Width   Attribute                                                Description
+ 159–128        32     Control     Next descriptor pointer. Indicates the location of the next descriptor. Valid only if next_dp is set.
+ 127–96         32     Control     Destination address. Software programs this field to indicate the destination address. For a
+                                   write DMA, the destination address is a CSB address that is mapped to a PCI Express memory
+                                   address using the outbound window address translation. For a read DMA, the destination
+                                   address is the CSB address.
+                                                                                                  PCI Express Interface Controller
+                      Table 14-143. DMA Descriptor Bit Fields Description (continued)
+  Bits     Width   Attribute                                              Description
+  95–64     32      Control    Source address. Software programs this field to indicate the source address. For a write DMA,
+                               the source address is the CSB address. For a read DMA, the source address is a CSB address
+                               that is mapped to a PCI Express memory address using the outbound window address
+                               translation.
+  63–37     27        —        Reserved
+   36        1      Status     PCI Express error. Hardware sets this bit to indicate that a DMA data transfer corresponding
+                               to descriptor cannot complete due to a PCI Express error.
+   35        1      Status     Bridge error. Hardware sets this bit to indicate that DMA data transfer corresponding to
+                               descriptor cannot complete due to Bridge error.
+   34        1      Status     CSB error. Hardware sets this bit to indicate that complete data cannot be fetched due to an
+                               CSB Error.
+   33        1      Status     Descriptor error. Hardware sets this bit to indicate that the next descriptor cannot be fetched
+                               due to an CSB error.
+   32        1      Status     Done. Hardware sets this bit after completing the transaction.
+  31–30      2        —        Reserved
+  29–12     18      Control    Transfer length. Software programs this field to indicate the length of transfers in DW or data
+                               payload size. A value of zero means that no data is transferred.
+  11–8       4      Control    Last byte enable indicates the byte enables of the last DW to be transmitted by DMA.
+   7–4       4      Control    First byte enable. Indicates the byte enables of first DW to be transmitted by DMA.
+    3        1      Control    Snoop for CSB transactions.
+                               0 The memory transaction is broadcast on the CSB as non-global (that is, not snooped).
+                               1 The memory transaction is broadcast on the CSB as global (that is, snooped)
+    2        1      Control    No snoop for PCI Express transactions. Indicates the no snoop value to be used in TLP header
+                               for PCI Express transactions.
+    1        1      Control    Next descriptor pointer—valid. Software sets this bit to indicate that a descriptor has a valid
+                               next descriptor pointer next_dp. When this bit is cleared, the address of the next descriptor is
+                               implicitly specified. This bit must be cleared for block descriptor-based memory.
+    0        1      Control    Valid. Software sets this bit to indicate that a descriptor is valid and has the information related
+                               to data transfer.
+14.8.2       Write DMA
+The PCI Express or CSB software can program the write DMA engines to send data from the CSB system
+to the PCI Express. After the control registers are programmed, the write DMA engine issues a CSB read
+request through the DMA read master. To improve system performance, the DMA request is segmented
+according to a natural aligned CSB address boundary of maximum transfer size (32 bytes).
+The entire address space accessed by the DMA controller is prefetchable, so the CSB read request for
+DMA operation always reads all the bytes. All segments use the same ID and are posted without waiting
+for the previous read response.
+Freescale Semiconductor                                                                                                     14-129
+PCI Express Interface Controller
+When a response to a CSB read request is received, the segments are packed into the PCI Express memory
+write request according to the PCI Express MPS. All data requested by the DMA controller is processed
+as a single data stream as described in this section. For example, when a 256-byte request starting from
+address 0 is segmented to eight 32-byte CSB read requests, then it is segmented to two 128-byte PCI
+Express write requests (assuming a 128-byte MPS).
+If all data can be packed into one PCI Express write request, no segmentation is performed. Otherwise, the
+first segment starts from the start address and ends at the MPS address boundary. Byte enables are set
+according to DMA control register settings. All other segments except the last one start from the MPS
+address boundary and end at the next boundary. That is, the size of a write request is equal to MPS. All
+bytes are enabled. Remaining data, if applicable from the last MPS address boundary to the PCI Express
+end address, is packed into the last segment. Byte enables are set according to DMA control register
+settings. When all segments get an CSB response with a status of OKAY, the DMA data transfer has
+completed successfully.
+If any data within an CSB read response is aborted by the CSB slave (SLVERR response), all the data
+received before that point is packed and sent. Any remaining data returned from the CSB slave is
+discarded, and an error is logged.
+If any segment gets a response of DECERR, all data received before that point is packed and sent. Any
+remaining data returned from the CSB slave is discarded, and an error is logged.
+The CSB read master can issue multiple pending CSB read requests if the requests belong to a single DMA
+request. When all segments are successfully received (that is, they get an CSB response with a status of
+OKAY), the CSB read master starts processing the next DMA request.
+14.8.3         Read DMA
+The read DMA engines can be programmed by the PCI Express or CSB software to send data from the
+PCI Express system to the CSB system. After the control registers are programmed, the read DMA engine
+issues a PCI Express read request. The DMA request is segmented according to the PCI Express MRRS
+natural aligned address boundary. If all data can be requested in one read request, no segmentation is
+performed. Otherwise, the first segment starts from the start address and ends at the first MRRS boundary.
+All other segments except the last one start from the MRRS address boundary and end at the next
+boundary. That is, the length of the read request is equal to MRRS. Any remaining data, if applicable from
+the last MRRS address boundary to the end address, is requested in the last segment.
+The entire address space accessed by the DMA controller is considered as prefetchable, so a PCI Express
+read request for DMA operation always enables all byte enables. All segments have a unique tag, so
+multiple read requests can be pending at any given time.
+To improve system performance, when a PCI Express completion comes back, it is segmented according
+to the CSB maximum size natural aligned address boundary. If all data can be packed into one CSB write
+request, no segmentation is performed, and the write is performed according to the DMA control register
+settings. Otherwise, the first segment starts from the start address and ends at the first CSB address
+boundary. All other segments except the last one start from the CSB address boundary and end at the next
+boundary. That is, the size of the write request is equal to the CSB maximum size packet. All bytes within
+each data phase are enabled.
+                                                                                    PCI Express Interface Controller
+Any remaining data, if applicable from the last CSB address boundary to the PCI Express end address, is
+packed into the last segment.
+Each completion is segmented as a single data stream according to these rules. For example, when a
+256-byte request starting from address 0 is converted to two 128-byte PCI Express read requests
+(assuming a 128-byte MPS/MRRS), the bridge issues two read requests if a tag and a completion buffer
+are available. When any completion comes back, it is segmented as described in this section. No scatter
+gather is performed. Because PCI Express can return completions in any order, the bridge may not issue
+an CSB write request in address order.
+When all segments get a response with a PCI Express completion that has a status of successful, the DMA
+data transfer has completed successfully. If any segment gets a response with a status other than successful,
+or a completion timeout occurs, the DMA data transfer completes with an error status after all requests
+complete either normally or abnormally. The data returned for prior requests is still processed and sent to
+the CSB accordingly.
+14.8.4       Descriptor-Based DMA
+Descriptor-based DMA operation has a specific format in which the host can store information about a data
+transfer, such as the source address for the data to be transferred, the destination address, the data transfer
+size, location of the next descriptor, and so on. The host can program a series of descriptors and store them
+in host local memory. The host also programs the DMA control register to indicate the location of the first
+descriptor. The DMA control registers are part of the bridge device-specific registers. After programming
+the control register and descriptors, the host is free to continue with its other functions. The DMA engine
+is responsible for fetching the descriptor from host memory and moving data from/to host memory.
+Software can organize the descriptors in two different formats that are only for reference and do not affect
+the hardware functionality and requirements:
+    • Chain descriptor
+    • Block descriptor
+14.8.4.1      Chain Descriptor
+Chain descriptors form an n-way chain in which each descriptor implicitly or explicitly contains the
+address of the next descriptor. This enables the host to use memory efficiently to store the descriptors even
+when contiguous memory locations are not available. When the host needs to initiate another transfer, it
+adds another descriptor in its memory and modifies the pointer of the last descriptor in the chain to the
+location of the new descriptor. Figure 14-143 illustrates the chain descriptor organization in host memory.
+                                    D1               D(n+1)             D(2n+1)
+                                    D2               D(n+2)             D(2n+2)
+                                     •                  •                  •
+                                     •                  •                  •
+                                    Dn               D(n+n)             D(2n+n)
+                    Figure 14-143. n-Way Chain Descriptor Organization in Host Memory
+Freescale Semiconductor                                                                                     14-131
+PCI Express Interface Controller
+The number of ways, n, is software configurable. In this mode, n descriptors are written in contiguous
+memory locations. The implicit address of the next descriptor is the next memory location. The last
+descriptor in the contiguous block contains the explicit address pointer of the next set of n descriptors.
+Address 0x0 will never be part of the chain since it should close the chain. Non-contiguous valid
+descriptors are not supported. If the valid bit of a descriptor in the chain is not set, all of the succeeding
+descriptors should also have the valid bit as zero.
+The software need to follow the following sequence on receiving a chain transfer done interrupt:
+   1. Software receives an interrupt for chain transfer done.
+   2. Software polls the main memory and waits for descriptor done bit to be set (bit 32 in the descriptor).
+       This guarantees that the final data has been written into memory for read DMA. For write DMA,
+       it guarantees that the final data has been sent to PCI Express controller. If a read is sent to the same
+       location, PCI Express controller guarantees that the outbound read will not bypass the outbound
+       write.
+The host can reuse the descriptor memory after the DMA/bridge logic processes it. The exact handshake
+between the hardware and software is described later in this chapter. The DMA registers are described in
+Section 14.5.5, “DMA Registers.”
+When n > 1, the hardware uses this knowledge to prefetch descriptors in advance, thereby reducing
+possible holes in transmission. This might be useful for applications that request several small DMA
+transfer requests, such as an Ethernet traffic. For applications that request large data transfers, the effect
+on performance due to descriptor fetching is not significant.
+14.8.4.2        Block Descriptors
+Block descriptors are a special case of chain descriptor in which all the descriptors are part of a single array.
+A portion of host memory is reserved to store the descriptors. The starting address of this block is indicated
+in the DMA control register. This block of memory serves as a circular buffer. Software writes the first
+descriptor to the first address in the descriptor block address space. Subsequent descriptors are written in
+the consecutive locations until the last location in the descriptor space. After that, the next descriptor is
+again written into the first location. All descriptors except the one written into the last descriptor location
+in the block have an implicit address that points to the immediate next descriptor location in the block. The
+last descriptor contains an explicit address pointer to the first descriptor location of the block. Software
+must ensure that a descriptor is processed by hardware before overwriting it. Figure 14-144 illustrates the
+organization of the block descriptors in memory.
+                                                                D1
+                                                                D2
+                                         Descriptor Memory
+                                                Space            •
+                                                                 •
+                                                                Dn
+                           Figure 14-144. Block Descriptor Organization in Host Memory
+The DMA can fetch prefetch a configurable number of descriptors in a single shot. This number depends
+on the chain organization (n) as well as the number of descriptor registers in the DMA engine.
+                                                                                     PCI Express Interface Controller
+14.8.4.3      Descriptor Format
+For more information on descriptor format, refer to Section 14.8.1, “DMA Descriptor Format.” The
+fetched descriptors are stored in the bridge configuration space registers. Each time the DMA controller
+fetches a new set of descriptors, the register is updated to indicate the value/fields of the descriptors. After
+completion of a transaction specified by a descriptor, the status fields are updated in the descriptor registers
+in the configuration space. Also, the descriptor status is written back into host local memory and an
+interrupt is generated if enabled. When the last of n descriptors is processed, the next set of descriptors is
+fetched from memory.
+14.8.4.4      Software-Hardware Handshake
+Hardware and software communicate through descriptors, control registers, and interrupts. The control
+register programmed by software indicates to hardware the location of the first descriptor. The descriptors
+programmed by software in host memory or directly in the descriptor register provide information to the
+hardware about the impending data transfer. After the initial descriptor location and other DMA
+parameters are programmed in the DMA control registers, software sets the ‘start’ bit in the control register
+to trigger the DMA controller to initiate the operation. When it detects that the ‘start’ bit is set, the DMA
+controller uses these programmed DMA parameters to initiate a descriptor fetch and the corresponding
+data transfer, and then it clears the “start” bit.
+The DMA controller executes the transfer according to the instructions given in the descriptor and then

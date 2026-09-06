@@ -53,10 +53,14 @@ ping -c 300 -i 0.005 -q -W 1 -I "$IF" "$GW" | tail -n 2
 
 echo; echo "==== after ===="; ctr
 ip -s -s link show "$IF" | sed -n '3,$p'
+echo; echo "==== link / pause ===="
+dmesg | grep -E 'enp7s0: Link is' | tail -n 1
+ethtool -a "$IF" 2>/dev/null | tail -n 3
 echo; echo "==== PCIe: card ===="
 lspci -vvv -s "$DEV" | grep -E 'DevSta:|UESta:|CESta:|HeaderLog'
 echo "==== PCIe: root port ===="
 RP=$(basename "$(dirname "$(readlink -f /sys/bus/pci/devices/$DEV)")")
 lspci -vvv -s "$RP" | grep -E 'DevSta:|UESta:|CESta:'
 echo; echo "==== ethtool -S (non-zero) ===="; ethtool -S "$IF" | awk '$2 != 0'
-echo; echo "==== dmesg ===="; dmesg | grep -iE 'killer|enp7|DMA bus|aer' | tail -n 8
+echo; echo "==== dmesg ===="; dmesg | grep -iE 'killer|enp7|DMA bus|aer' | grep -v 'bad rx bd' | tail -n 6
+echo "bad rx bd lines this run: $(dmesg | grep -c 'bad rx bd')"

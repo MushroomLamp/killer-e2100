@@ -18,3 +18,4 @@ i2c
 # hardware dumps: card memory (large) and Bigfoot's proprietary firmware (not ours to publish)
 *.bin
 fw/
+docs/*.pdf
