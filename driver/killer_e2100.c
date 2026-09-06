@@ -1,47 +1,78 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * killer_e2100 - Linux network driver for the Bigfoot Networks Killer E2100
- * ("Xeno", Freescale MPC8308 based NIC, PCI 1957:c006 / 1a56:1201).
+ * ("Xeno": a Freescale MPC8308 PowerPC SoC on PCIe, 1957:c006 / 1a56:1201).
  *
- * The card is a PowerPC SoC. Its own firmware never boots past u-boot, so we
- * ignore it and drive the SoC's eTSEC1 ethernet MAC directly from the host:
- *   BAR0 = the SoC's 1 MB CCSR register window (big-endian registers).
- *   BAR1 = 64 KB, retargeted at probe to card DDR 0x04000000 by writing the
- *          PCIe endpoint inbound translation register. Rings and packet
- *          buffers live there, so the MAC's DMA never touches host memory.
- *          (v1 = PIO copies; v2 will DMA straight into host RAM through the
- *          PCIe outbound window.)
- * No host interrupt exists for the MAC (its IRQs go to the card's own PIC),
- * so NAPI is driven by an hrtimer.
+ * The card's own firmware never boots past u-boot, so the host drives the
+ * SoC's eTSEC1 ethernet MAC directly through BAR0, which is the SoC's 1 MB
+ * CCSR register window (big-endian registers, except the PCIe block which
+ * is little-endian).
+ *
+ * Data path: one 1 MB DMA-coherent region in host RAM holds the buffer
+ * descriptor rings and packet buffers. The SoC's PCIe outbound window 1 is
+ * programmed to map card-local 0xB0000000..+1MB onto that region, so the
+ * MAC's DMA engine reads and writes host memory through it. The window is
+ * exactly the size of the region, so the card cannot address any other host
+ * memory: that is what keeps an IOMMU-less host safe.
+ *
+ * The MAC's interrupts terminate in the card's own interrupt controller, not
+ * the host, so NAPI is driven by an hrtimer. The PHY (Marvell 88E1116R) is
+ * handled by phylib over the eTSEC's MDIO block.
  */
 #include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
 #include <linux/ethtool.h>
+#include <linux/phy.h>
 #include <linux/hrtimer.h>
 #include <linux/ktime.h>
 #include <linux/io.h>
 #include <linux/delay.h>
+#include <linux/dma-mapping.h>
 #include <linux/workqueue.h>
 #include <linux/spinlock.h>
-#include <linux/mutex.h>
 #include <linux/version.h>
 #include <linux/skbuff.h>
 #include <linux/if_ether.h>
+#include <linux/rtnetlink.h>
 
 #define DRV_NAME "killer_e2100"
+#define DRV_VERSION "0.2"
 
 /* ---- card address map ---- */
 #define CCSR_SPRIDR   0x108
-#define PEX_EPIWTAR1  0x9de4        /* little-endian, PCIe block */
-#define DDR_WIN       0x04000000u   /* card DDR address BAR1 points at */
+#define PEX_EPIWTAR1  0x9de4   /* BAR1 -> card DDR, kept for the debug tools */
+#define PEX_OWAR1     0x9cb0   /* outbound window 1: ar, bar, tarl, tarh (LE) */
+#define DDR_WIN       0x04000000u
+#define OB_BAR        0xB0000000u
+#define OB_SIZE       0x100000u
+#define OWAR_EN       0x1u
+#define OWAR_TYPE_MEM 0x4u
 #define ETSEC         0x24000u
 
 /* ---- eTSEC registers ---- */
 #define IEVENT 0x010
 #define IMASK 0x014
 #define ECNTRL 0x020
+#define FIFO_RX_PAUSE 0x050
+#define FIFO_RX_PAUSE_SHUTOFF 0x054
+#define FIFO_RX_ALARM 0x058
+#define FIFO_RX_ALARM_SHUTOFF 0x05c
+#define FIFO_TX_THR 0x08c
+#define RMON_RBYT 0x69c
+#define RMON_RPKT 0x6a0
+#define RMON_RFCS 0x6a4
+#define RMON_RUND 0x6cc
+#define RMON_ROVR 0x6d0
+#define RMON_RFRG 0x6d4
+#define RMON_RJBR 0x6d8
+#define RMON_RDRP 0x6dc
+#define RMON_TBYT 0x6e0
+#define RMON_TPKT 0x6e4
+#define RMON_TDRP 0x714
+#define RMON_TFCS 0x71c
+#define RMON_TUND 0x728
 #define DMACTRL 0x02c
 #define TSTAT 0x104
 #define TQUEUE 0x114
@@ -59,6 +90,7 @@
 #define MIIMCFG 0x520
 #define MIIMCOM 0x524
 #define MIIMADD 0x528
+#define MIIMCON 0x52c
 #define MIIMSTAT 0x530
 #define MIIMIND 0x534
 #define MACSTNADDR1 0x540
@@ -68,9 +100,14 @@
 #define MACCFG1_SOFT_RESET 0x80000000u
 #define MACCFG1_RX_EN 0x4u
 #define MACCFG1_TX_EN 0x1u
+#define MACCFG1_RX_FLOW 0x20u   /* act on received PAUSE frames */
+#define MACCFG1_TX_FLOW 0x10u   /* send PAUSE frames when the RX FIFO fills */
 #define ECNTRL_STEN 0x1000u
 #define ECNTRL_R100 0x8u
-#define DMACTRL_INIT 0xc3u
+#define DMACTRL_TDSEN 0x80u
+#define DMACTRL_TBDSEN 0x40u
+#define DMACTRL_WWR 0x2u     /* wait for a response to every write: deadly over PCIe */
+#define DMACTRL_WOP 0x1u
 #define DMACTRL_GRS 0x10u
 #define DMACTRL_GTS 0x8u
 #define TSTAT_THLT0 0x80000000u
@@ -80,6 +117,13 @@
 #define RCTRL_PROM 0x8u
 #define IEVENT_GRSC 0x100u
 #define IEVENT_GTSC 0x02000000u
+#define IEVENT_BSY 0x20000000u        /* RX: no free buffer, frame dropped */
+#define IEVENT_EBERR 0x10000000u      /* DMA bus error: the card could not reach host RAM */
+#define IEVENT_TXE 0x00400000u
+#define IEVENT_XFUN 0x00010000u       /* TX FIFO underrun */
+#define IEVENT_ERRS (IEVENT_BSY | IEVENT_EBERR | IEVENT_TXE | IEVENT_XFUN)
+#define MIIMIND_BUSY 0x1u
+#define MIIMIND_NOTVALID 0x4u
 
 #define TXBD_READY 0x8000
 #define TXBD_WRAP 0x2000
@@ -89,57 +133,100 @@
 #define RXBD_WRAP 0x2000
 #define RXBD_LAST 0x0800
 #define RXBD_FIRST 0x0400
+#define RXBD_LG 0x0020
+#define RXBD_NO 0x0010
+#define RXBD_SH 0x0008
 #define RXBD_CRCERR 0x0004
+#define RXBD_OV 0x0002
+#define RXBD_TR 0x0001
 #define RXBD_ERRS 0x003f
 
-/* ---- PHY (Marvell 88E1116R at MDIO address 1) ---- */
 #define PHY_ADDR 1
-#define MII_BMSR 1
-#define MII_PHYID1 2
-#define MII_PHYID2 3
-#define MARVELL_CSTAT 17
-#define CSTAT_LINK 0x0400
-#define CSTAT_RESOLVED 0x0800
-#define CSTAT_FD 0x2000
 
-/* ---- ring layout inside the 64 KB BAR1 window ---- */
-#define NTX 8
-#define NRX 16
+/* ---- layout of the DMA region ---- */
+#define NTX 64
+#define NRX 128
 #define BUFSZ 2048
 #define TXBD_OFF 0x0000
-#define RXBD_OFF 0x0100
-#define TXBUF_OFF 0x1000
-#define RXBUF_OFF 0x5000
+#define RXBD_OFF 0x1000
+#define TXBUF_OFF 0x2000
+#define RXBUF_OFF (TXBUF_OFF + NTX * BUFSZ)
+#define AREA_END (RXBUF_OFF + NRX * BUFSZ)
+
+struct bd {
+	__be16 status;
+	__be16 len;
+	__be32 buf;
+};
 
 static int poll_us = 500;
 module_param(poll_us, int, 0444);
-MODULE_PARM_DESC(poll_us, "NAPI poll period in microseconds (no host IRQ exists)");
+MODULE_PARM_DESC(poll_us, "NAPI poll period in microseconds (the MAC has no host IRQ)");
+
+/*
+ * Transmit FIFO threshold. The MAC starts putting a frame on the wire once
+ * this much of it is in its FIFO, then must be fed at line rate. Our frames
+ * are fetched from host RAM over PCIe, which cannot keep up with 1 Gbit/s
+ * read-by-read, so we make it wait for (almost) the whole frame:
+ * store-and-forward. 4-byte units.
+ */
+static int tx_thr = 0x180;
+module_param(tx_thr, int, 0444);
+MODULE_PARM_DESC(tx_thr, "eTSEC FIFO_TX_THR value (4-byte units)");
+
+/*
+ * DMACTRL. gianfar uses 0xc3 = TDSEN|TBDSEN|WWR|WOP. WWR makes the DMA wait
+ * for a bus response to every write burst, which over PCIe means a full
+ * round trip per 32 bytes: far too slow to drain the RX FIFO at gigabit.
+ * PCIe posted writes are ordered anyway, so drop WWR and WOP.
+ */
+static int dmactrl = 0xc0;
+module_param(dmactrl, int, 0444);
+MODULE_PARM_DESC(dmactrl, "eTSEC DMACTRL value (default 0xc0: TDSEN|TBDSEN, no WWR/WOP)");
+
+static int flowctrl = 1;
+module_param(flowctrl, int, 0444);
+MODULE_PARM_DESC(flowctrl, "advertise and use 802.3x PAUSE flow control (default 1)");
+
+/* RX FIFO pause/alarm thresholds, 4-byte units, 2 KB FIFO */
+static int rx_pause_on = 0x140, rx_pause_off = 0x0c0, rx_alarm_on = 0x100, rx_alarm_off = 0x080;
+module_param(rx_pause_on, int, 0444);
+module_param(rx_pause_off, int, 0444);
+module_param(rx_alarm_on, int, 0444);
+module_param(rx_alarm_off, int, 0444);
 
 struct kl {
 	struct pci_dev *pdev;
 	struct net_device *ndev;
-	void __iomem *ccsr, *win;
+	void __iomem *ccsr;
+	void *area;
+	dma_addr_t area_dma;
+	struct bd *txbd, *rxbd;
+	struct mii_bus *mii_bus;
 	struct napi_struct napi;
 	struct hrtimer timer;
 	ktime_t period;
-	struct delayed_work link_work;
-	struct mutex mdio_lock;
+	struct work_struct reset_work;
 	spinlock_t tx_lock;
 	unsigned int tx_head, tx_tail, tx_count, rx_cur;
-	int link, speed, duplex;
+	int speed, duplex;
+	u64 bd_tr, bd_ov, bd_cr, bd_sh, bd_no, bd_lg, bd_frag;
+	u64 ev_xfun, ev_txe, ev_bsy, ev_eberr;
 };
 
 static inline u32 er(struct kl *k, u32 r) { return ioread32be(k->ccsr + ETSEC + r); }
 static inline void ew(struct kl *k, u32 r, u32 v) { iowrite32be(v, k->ccsr + ETSEC + r); }
+static inline u8 *txbuf(struct kl *k, unsigned int i) { return k->area + TXBUF_OFF + i * BUFSZ; }
+static inline u8 *rxbuf(struct kl *k, unsigned int i) { return k->area + RXBUF_OFF + i * BUFSZ; }
 
-/* ---------------- MDIO ---------------- */
+/* ---------------- MDIO (process context only) ---------------- */
 static int miim_wait(struct kl *k, u32 mask)
 {
 	int i;
-	for (i = 0; i < 2000; i++) {
+	for (i = 0; i < 1000; i++) {
 		if (!(er(k, MIIMIND) & mask))
 			return 0;
-		udelay(5);
+		usleep_range(5, 15);
 	}
 	return -ETIMEDOUT;
 }
@@ -148,39 +235,34 @@ static void miim_init(struct kl *k)
 {
 	ew(k, MIIMCFG, 0x80000000u);
 	ew(k, MIIMCFG, 7);
-	miim_wait(k, 1);
+	miim_wait(k, MIIMIND_BUSY);
 }
 
-static int phy_read(struct kl *k, int reg)
+static int kl_mdio_read(struct mii_bus *bus, int addr, int reg)
 {
-	ew(k, MIIMADD, (PHY_ADDR << 8) | reg);
+	struct kl *k = bus->priv;
+	ew(k, MIIMADD, (addr << 8) | reg);
 	ew(k, MIIMCOM, 0);
 	ew(k, MIIMCOM, 1);
-	if (miim_wait(k, 1 | 4))
+	if (miim_wait(k, MIIMIND_BUSY | MIIMIND_NOTVALID))
 		return -ETIMEDOUT;
 	return er(k, MIIMSTAT) & 0xffff;
 }
 
-/* returns 1 if link up, fills speed/duplex */
-static int phy_status(struct kl *k, int *speed, int *duplex)
+static int kl_mdio_write(struct mii_bus *bus, int addr, int reg, u16 val)
 {
-	int cs;
-	mutex_lock(&k->mdio_lock);
-	cs = phy_read(k, MARVELL_CSTAT);
-	mutex_unlock(&k->mdio_lock);
-	if (cs < 0)
-		return 0;
-	*speed = (cs >> 14) == 2 ? 1000 : (cs >> 14) == 1 ? 100 : 10;
-	*duplex = !!(cs & CSTAT_FD);
-	return !!(cs & CSTAT_LINK);
+	struct kl *k = bus->priv;
+	ew(k, MIIMADD, (addr << 8) | reg);
+	ew(k, MIIMCON, val);
+	return miim_wait(k, MIIMIND_BUSY);
 }
 
 /* ---------------- MAC ---------------- */
-static void mac_set_speed(struct kl *k, int speed, int duplex)
+static void mac_set_speed(struct kl *k, int speed, int full)
 {
-	u32 cfg2 = 0x7000 | (speed == 1000 ? 0x200 : 0x100) | 0x4 | (duplex ? 1 : 0);
+	u32 cfg2 = 0x7000 | (speed == SPEED_1000 ? 0x200 : 0x100) | 0x4 | (full ? 1 : 0);
 	u32 ec = (er(k, ECNTRL) & ~ECNTRL_R100) | ECNTRL_STEN;
-	if (speed == 100)
+	if (speed == SPEED_100)
 		ec |= ECNTRL_R100;
 	ew(k, MACCFG2, cfg2);
 	ew(k, ECNTRL, ec);
@@ -203,7 +285,6 @@ static void kl_set_rx_mode(struct net_device *ndev)
 	if (ndev->flags & IFF_PROMISC)
 		rctrl |= RCTRL_PROM;
 	ew(k, RCTRL, rctrl);
-	/* group hash: all-ones accepts every multicast, good enough for v1 */
 	for (i = 0; i < 8; i++)
 		ew(k, GADDR0 + i * 4, allmulti ? 0xffffffffu : 0);
 }
@@ -212,26 +293,36 @@ static void rings_init(struct kl *k)
 {
 	int i;
 	for (i = 0; i < NTX; i++) {
-		iowrite32be(DDR_WIN + TXBUF_OFF + i * BUFSZ, k->win + TXBD_OFF + i * 8 + 4);
-		iowrite16be(0, k->win + TXBD_OFF + i * 8 + 2);
-		iowrite16be(i == NTX - 1 ? TXBD_WRAP : 0, k->win + TXBD_OFF + i * 8);
+		k->txbd[i].buf = cpu_to_be32(OB_BAR + TXBUF_OFF + i * BUFSZ);
+		k->txbd[i].len = 0;
+		k->txbd[i].status = cpu_to_be16(i == NTX - 1 ? TXBD_WRAP : 0);
 	}
 	for (i = 0; i < NRX; i++) {
-		iowrite32be(DDR_WIN + RXBUF_OFF + i * BUFSZ, k->win + RXBD_OFF + i * 8 + 4);
-		iowrite16be(0, k->win + RXBD_OFF + i * 8 + 2);
-		iowrite16be(RXBD_EMPTY | (i == NRX - 1 ? RXBD_WRAP : 0), k->win + RXBD_OFF + i * 8);
+		k->rxbd[i].buf = cpu_to_be32(OB_BAR + RXBUF_OFF + i * BUFSZ);
+		k->rxbd[i].len = 0;
+		k->rxbd[i].status = cpu_to_be16(RXBD_EMPTY | (i == NRX - 1 ? RXBD_WRAP : 0));
 	}
 	k->tx_head = k->tx_tail = k->tx_count = 0;
 	k->rx_cur = 0;
+	dma_wmb();
 }
 
+/* MAC reset also resets the MDIO block, so hold the bus lock across it */
 static void hw_start(struct kl *k)
 {
+	mutex_lock(&k->mii_bus->mdio_lock);
 	ew(k, MACCFG1, MACCFG1_SOFT_RESET);
 	udelay(10);
 	ew(k, MACCFG1, 0);
 	miim_init(k);
-	mac_set_speed(k, k->speed, k->duplex);
+	mutex_unlock(&k->mii_bus->mdio_lock);
+
+	mac_set_speed(k, k->speed, k->duplex == DUPLEX_FULL);
+	ew(k, FIFO_TX_THR, tx_thr);
+	ew(k, FIFO_RX_PAUSE, rx_pause_on);
+	ew(k, FIFO_RX_PAUSE_SHUTOFF, rx_pause_off);
+	ew(k, FIFO_RX_ALARM, rx_alarm_on);
+	ew(k, FIFO_RX_ALARM_SHUTOFF, rx_alarm_off);
 	ew(k, MAXFRM, 1536);
 	mac_set_addr(k);
 	ew(k, IMASK, 0);
@@ -240,14 +331,14 @@ static void hw_start(struct kl *k)
 	rings_init(k);
 	ew(k, MRBLR, BUFSZ);
 	ew(k, RBASEH, 0);
-	ew(k, RBASE0, DDR_WIN + RXBD_OFF);
+	ew(k, RBASE0, OB_BAR + RXBD_OFF);
 	ew(k, TBASEH, 0);
-	ew(k, TBASE0, DDR_WIN + TXBD_OFF);
+	ew(k, TBASE0, OB_BAR + TXBD_OFF);
 	ew(k, RQUEUE, RQUEUE_EN0);
 	ew(k, TQUEUE, TQUEUE_EN0);
 	kl_set_rx_mode(k->ndev);
 
-	ew(k, DMACTRL, (er(k, DMACTRL) | DMACTRL_INIT) & ~(DMACTRL_GRS | DMACTRL_GTS));
+	ew(k, DMACTRL, dmactrl & ~(DMACTRL_GRS | DMACTRL_GTS));
 	ew(k, RSTAT, RSTAT_RHLT0);
 	ew(k, TSTAT, TSTAT_THLT0);
 	ew(k, MACCFG1, er(k, MACCFG1) | MACCFG1_RX_EN | MACCFG1_TX_EN);
@@ -272,7 +363,6 @@ static netdev_tx_t kl_xmit(struct sk_buff *skb, struct net_device *ndev)
 	struct kl *k = netdev_priv(ndev);
 	unsigned long flags;
 	unsigned int i;
-	u16 st;
 
 	if (skb_put_padto(skb, ETH_ZLEN)) {
 		ndev->stats.tx_dropped++;
@@ -291,12 +381,12 @@ static netdev_tx_t kl_xmit(struct sk_buff *skb, struct net_device *ndev)
 		return NETDEV_TX_BUSY;
 	}
 	i = k->tx_head;
-	memcpy_toio(k->win + TXBUF_OFF + i * BUFSZ, skb->data, skb->len);
-	iowrite16be(skb->len, k->win + TXBD_OFF + i * 8 + 2);
+	skb_copy_from_linear_data(skb, txbuf(k, i), skb->len);
+	k->txbd[i].len = cpu_to_be16(skb->len);
+	dma_wmb();
+	k->txbd[i].status = cpu_to_be16(TXBD_READY | TXBD_LAST | TXBD_CRC | (i == NTX - 1 ? TXBD_WRAP : 0));
 	wmb();
-	st = TXBD_READY | TXBD_LAST | TXBD_CRC | (i == NTX - 1 ? TXBD_WRAP : 0);
-	iowrite16be(st, k->win + TXBD_OFF + i * 8);
-	ew(k, TSTAT, TSTAT_THLT0);           /* wake the TX DMA if it halted */
+	ew(k, TSTAT, TSTAT_THLT0);            /* wake the TX DMA if it halted on an empty ring */
 	k->tx_head = (i + 1) % NTX;
 	if (++k->tx_count == NTX)
 		netif_stop_queue(ndev);
@@ -304,7 +394,7 @@ static netdev_tx_t kl_xmit(struct sk_buff *skb, struct net_device *ndev)
 	ndev->stats.tx_bytes += skb->len;
 	spin_unlock_irqrestore(&k->tx_lock, flags);
 
-	dev_kfree_skb_any(skb);              /* data is already in card DDR */
+	dev_kfree_skb_any(skb);
 	return NETDEV_TX_OK;
 }
 
@@ -313,7 +403,7 @@ static void tx_reap(struct kl *k)
 	unsigned long flags;
 	spin_lock_irqsave(&k->tx_lock, flags);
 	while (k->tx_count) {
-		if (ioread16be(k->win + TXBD_OFF + k->tx_tail * 8) & TXBD_READY)
+		if (be16_to_cpu(READ_ONCE(k->txbd[k->tx_tail].status)) & TXBD_READY)
 			break;
 		k->tx_tail = (k->tx_tail + 1) % NTX;
 		k->tx_count--;
@@ -330,41 +420,72 @@ static int rx_poll(struct kl *k, int budget)
 	int work = 0;
 
 	while (work < budget) {
-		void __iomem *bd = k->win + RXBD_OFF + k->rx_cur * 8;
-		u16 st = ioread16be(bd);
+		struct bd *bd = &k->rxbd[k->rx_cur];
+		u16 st = be16_to_cpu(READ_ONCE(bd->status));
 		u16 len;
 
 		if (st & RXBD_EMPTY)
 			break;
-		len = ioread16be(bd + 2);
+		dma_rmb();
+		len = be16_to_cpu(bd->len);
 
 		if ((st & RXBD_ERRS) || (st & (RXBD_FIRST | RXBD_LAST)) != (RXBD_FIRST | RXBD_LAST) ||
 		    len < ETH_HLEN + ETH_FCS_LEN || len > BUFSZ) {
 			ndev->stats.rx_errors++;
-			if (st & RXBD_CRCERR)
-				ndev->stats.rx_crc_errors++;
+			if (st & RXBD_CRCERR) { ndev->stats.rx_crc_errors++; k->bd_cr++; }
+			if (st & RXBD_TR) { ndev->stats.rx_fifo_errors++; k->bd_tr++; }
+			if (st & RXBD_OV) { ndev->stats.rx_over_errors++; k->bd_ov++; }
+			if (st & RXBD_SH) { ndev->stats.rx_length_errors++; k->bd_sh++; }
+			if (st & RXBD_LG) { ndev->stats.rx_length_errors++; k->bd_lg++; }
+			if (st & RXBD_NO) { ndev->stats.rx_frame_errors++; k->bd_no++; }
+			if ((st & (RXBD_FIRST | RXBD_LAST)) != (RXBD_FIRST | RXBD_LAST)) k->bd_frag++;
+			net_warn_ratelimited("%s: bad rx bd status %04x len %u\n", ndev->name, st, len);
 		} else {
 			struct sk_buff *skb;
 			len -= ETH_FCS_LEN;
-			skb = netdev_alloc_skb_ip_align(ndev, len);
+			skb = napi_alloc_skb(&k->napi, len);
 			if (!skb) {
 				ndev->stats.rx_dropped++;
 			} else {
-				memcpy_fromio(skb_put(skb, len), k->win + RXBUF_OFF + k->rx_cur * BUFSZ, len);
+				skb_copy_to_linear_data(skb, rxbuf(k, k->rx_cur), len);
+				skb_put(skb, len);
 				skb->protocol = eth_type_trans(skb, ndev);
 				ndev->stats.rx_packets++;
 				ndev->stats.rx_bytes += len;
 				napi_gro_receive(&k->napi, skb);
 			}
 		}
-		/* hand the buffer back */
-		iowrite16be(RXBD_EMPTY | (k->rx_cur == NRX - 1 ? RXBD_WRAP : 0), bd);
+		dma_wmb();
+		WRITE_ONCE(bd->status, cpu_to_be16(RXBD_EMPTY | (k->rx_cur == NRX - 1 ? RXBD_WRAP : 0)));
 		k->rx_cur = (k->rx_cur + 1) % NRX;
 		work++;
 	}
-	if (work)
-		ew(k, RSTAT, RSTAT_RHLT0);      /* restart RX DMA if it ran out of buffers */
+	if (work) {
+		wmb();
+		ew(k, RSTAT, RSTAT_RHLT0);
+	}
 	return work;
+}
+
+static void check_errors(struct kl *k)
+{
+	struct net_device *ndev = k->ndev;
+	u32 ev = er(k, IEVENT) & IEVENT_ERRS;
+
+	if (!ev)
+		return;
+	ew(k, IEVENT, ev);
+	if (ev & IEVENT_XFUN) { ndev->stats.tx_fifo_errors++; k->ev_xfun++; }
+	if (ev & IEVENT_TXE) { ndev->stats.tx_errors++; k->ev_txe++; }
+	if (ev & IEVENT_BSY) { ndev->stats.rx_missed_errors++; k->ev_bsy++; }
+	if (ev & IEVENT_EBERR) {
+		k->ev_eberr++;
+		net_err_ratelimited("%s: DMA bus error (IEVENT %08x)\n", ndev->name, ev);
+	}
+	if (ev & (IEVENT_TXE | IEVENT_XFUN))
+		ew(k, TSTAT, TSTAT_THLT0);   /* the TX DMA halts on an underrun; restart it */
+	if (ev & IEVENT_BSY)
+		ew(k, RSTAT, RSTAT_RHLT0);
 }
 
 static int kl_napi_poll(struct napi_struct *napi, int budget)
@@ -372,6 +493,7 @@ static int kl_napi_poll(struct napi_struct *napi, int budget)
 	struct kl *k = container_of(napi, struct kl, napi);
 	int work = rx_poll(k, budget);
 	tx_reap(k);
+	check_errors(k);
 	if (work < budget)
 		napi_complete_done(napi, work);
 	return work;
@@ -385,52 +507,85 @@ static enum hrtimer_restart kl_timer_fn(struct hrtimer *t)
 	return HRTIMER_RESTART;
 }
 
-/* ---------------- link monitor ---------------- */
-static void kl_link_work(struct work_struct *w)
+/* ---------------- phylib ---------------- */
+static void kl_adjust_link(struct net_device *ndev)
 {
-	struct kl *k = container_of(to_delayed_work(w), struct kl, link_work);
-	int speed = 1000, duplex = 1;
-	int link = phy_status(k, &speed, &duplex);
+	struct kl *k = netdev_priv(ndev);
+	struct phy_device *phydev = ndev->phydev;
 
-	if (link != k->link) {
-		k->link = link;
-		if (link) {
-			netif_carrier_on(k->ndev);
-			netdev_info(k->ndev, "link up, %d Mb/s %s duplex\n", speed, duplex ? "full" : "half");
-		} else {
-			netif_carrier_off(k->ndev);
-			netdev_info(k->ndev, "link down\n");
+	if (phydev->link) {
+		bool tx_pause = false, rx_pause = false;
+		u32 cfg1;
+
+		if (phydev->speed != k->speed || phydev->duplex != k->duplex) {
+			k->speed = phydev->speed;
+			k->duplex = phydev->duplex;
+			mac_set_speed(k, k->speed, k->duplex == DUPLEX_FULL);
 		}
+		if (flowctrl)
+			phy_get_pause(phydev, &tx_pause, &rx_pause);
+		cfg1 = er(k, MACCFG1) & ~(MACCFG1_RX_FLOW | MACCFG1_TX_FLOW);
+		if (rx_pause)
+			cfg1 |= MACCFG1_RX_FLOW;
+		if (tx_pause)
+			cfg1 |= MACCFG1_TX_FLOW;
+		ew(k, MACCFG1, cfg1);
 	}
-	if (link && (speed != k->speed || duplex != k->duplex)) {
-		k->speed = speed;
-		k->duplex = duplex;
-		mac_set_speed(k, speed, duplex);
+	phy_print_status(phydev);
+}
+
+/* ---------------- recovery ---------------- */
+static void kl_reset_work(struct work_struct *w)
+{
+	struct kl *k = container_of(w, struct kl, reset_work);
+	struct net_device *ndev = k->ndev;
+
+	rtnl_lock();
+	if (netif_running(ndev)) {
+		netif_stop_queue(ndev);
+		hrtimer_cancel(&k->timer);
+		napi_disable(&k->napi);
+		hw_stop(k);
+		hw_start(k);
+		napi_enable(&k->napi);
+		hrtimer_start(&k->timer, k->period, HRTIMER_MODE_REL);
+		netif_wake_queue(ndev);
+		netdev_warn(ndev, "MAC reset after TX timeout\n");
 	}
-	schedule_delayed_work(&k->link_work, HZ);
+	rtnl_unlock();
+}
+
+static void kl_tx_timeout(struct net_device *ndev, unsigned int txqueue)
+{
+	struct kl *k = netdev_priv(ndev);
+	ndev->stats.tx_errors++;
+	schedule_work(&k->reset_work);
 }
 
 /* ---------------- netdev ops ---------------- */
 static int kl_open(struct net_device *ndev)
 {
 	struct kl *k = netdev_priv(ndev);
+	struct phy_device *phydev = mdiobus_get_phy(k->mii_bus, PHY_ADDR);
+	int err;
 
-	miim_init(k);
-	k->speed = 1000;
-	k->duplex = 1;
-	k->link = phy_status(k, &k->speed, &k->duplex);
+	if (!phydev)
+		return -ENODEV;
+	/* RGMII_ID: the 88E1116R provides both clock delays on this board */
+	err = phy_connect_direct(ndev, phydev, kl_adjust_link, PHY_INTERFACE_MODE_RGMII_ID);
+	if (err)
+		return err;
+	phy_attached_info(phydev);
+	if (flowctrl)
+		phy_support_asym_pause(phydev);
 
+	k->speed = SPEED_1000;
+	k->duplex = DUPLEX_FULL;
 	hw_start(k);
 	napi_enable(&k->napi);
 	hrtimer_start(&k->timer, k->period, HRTIMER_MODE_REL);
-	if (k->link) {
-		netif_carrier_on(ndev);
-		netdev_info(ndev, "link up, %d Mb/s %s duplex\n", k->speed, k->duplex ? "full" : "half");
-	} else {
-		netif_carrier_off(ndev);
-	}
 	netif_start_queue(ndev);
-	schedule_delayed_work(&k->link_work, HZ);
+	phy_start(phydev);
 	return 0;
 }
 
@@ -438,12 +593,12 @@ static int kl_stop(struct net_device *ndev)
 {
 	struct kl *k = netdev_priv(ndev);
 
-	cancel_delayed_work_sync(&k->link_work);
+	phy_stop(ndev->phydev);
 	netif_stop_queue(ndev);
-	netif_carrier_off(ndev);
 	hrtimer_cancel(&k->timer);
 	napi_disable(&k->napi);
 	hw_stop(k);
+	phy_disconnect(ndev->phydev);
 	return 0;
 }
 
@@ -454,20 +609,83 @@ static const struct net_device_ops kl_netdev_ops = {
 	.ndo_set_rx_mode = kl_set_rx_mode,
 	.ndo_set_mac_address = eth_mac_addr,
 	.ndo_validate_addr = eth_validate_addr,
+	.ndo_tx_timeout = kl_tx_timeout,
+	.ndo_eth_ioctl = phy_do_ioctl_running,
 };
 
+static void kl_get_drvinfo(struct net_device *ndev, struct ethtool_drvinfo *info)
+{
+	struct kl *k = netdev_priv(ndev);
+	strscpy(info->driver, DRV_NAME, sizeof(info->driver));
+	strscpy(info->version, DRV_VERSION, sizeof(info->version));
+	strscpy(info->bus_info, pci_name(k->pdev), sizeof(info->bus_info));
+}
+
+static const char kl_stat_names[][ETH_GSTRING_LEN] = {
+	"mac_rx_packets", "mac_rx_bytes", "mac_rx_crc_err", "mac_rx_undersize", "mac_rx_overrun",
+	"mac_rx_fragments", "mac_rx_jabber", "mac_rx_dropped",
+	"mac_tx_packets", "mac_tx_bytes", "mac_tx_dropped", "mac_tx_crc_err", "mac_tx_underrun",
+	"bd_rx_truncated", "bd_rx_overrun", "bd_rx_crc", "bd_rx_short", "bd_rx_nonoctet", "bd_rx_large", "bd_rx_fragmented",
+	"ev_tx_underrun", "ev_tx_error", "ev_rx_busy", "ev_bus_error",
+};
+
+static int kl_get_sset_count(struct net_device *ndev, int sset)
+{
+	return sset == ETH_SS_STATS ? ARRAY_SIZE(kl_stat_names) : -EOPNOTSUPP;
+}
+
+static void kl_get_strings(struct net_device *ndev, u32 sset, u8 *data)
+{
+	if (sset == ETH_SS_STATS)
+		memcpy(data, kl_stat_names, sizeof(kl_stat_names));
+}
+
+static void kl_get_ethtool_stats(struct net_device *ndev, struct ethtool_stats *stats, u64 *data)
+{
+	struct kl *k = netdev_priv(ndev);
+	static const u16 rmon[] = { RMON_RPKT, RMON_RBYT, RMON_RFCS, RMON_RUND, RMON_ROVR, RMON_RFRG, RMON_RJBR, RMON_RDRP,
+				    RMON_TPKT, RMON_TBYT, RMON_TDRP, RMON_TFCS, RMON_TUND };
+	int i, n = 0;
+
+	for (i = 0; i < ARRAY_SIZE(rmon); i++)
+		data[n++] = er(k, rmon[i]);
+	data[n++] = k->bd_tr; data[n++] = k->bd_ov; data[n++] = k->bd_cr; data[n++] = k->bd_sh;
+	data[n++] = k->bd_no; data[n++] = k->bd_lg; data[n++] = k->bd_frag;
+	data[n++] = k->ev_xfun; data[n++] = k->ev_txe; data[n++] = k->ev_bsy; data[n++] = k->ev_eberr;
+}
+
 static const struct ethtool_ops kl_ethtool_ops = {
+	.get_drvinfo = kl_get_drvinfo,
+	.get_sset_count = kl_get_sset_count,
+	.get_strings = kl_get_strings,
+	.get_ethtool_stats = kl_get_ethtool_stats,
 	.get_link = ethtool_op_get_link,
+	.get_link_ksettings = phy_ethtool_get_link_ksettings,
+	.set_link_ksettings = phy_ethtool_set_link_ksettings,
+	.nway_reset = phy_ethtool_nway_reset,
 };
 
 /* ---------------- PCI ---------------- */
+static void ob_window_set(struct kl *k, bool enable)
+{
+	iowrite32(0, k->ccsr + PEX_OWAR1);
+	if (!enable)
+		return;
+	iowrite32(OB_BAR, k->ccsr + PEX_OWAR1 + 4);
+	iowrite32(lower_32_bits(k->area_dma), k->ccsr + PEX_OWAR1 + 8);
+	iowrite32(upper_32_bits(k->area_dma), k->ccsr + PEX_OWAR1 + 12);
+	iowrite32(OB_SIZE | OWAR_TYPE_MEM | OWAR_EN, k->ccsr + PEX_OWAR1);
+}
+
 static int kl_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	struct net_device *ndev;
 	struct kl *k;
-	u32 spridr, tar;
-	int err, id1, id2;
+	u32 spridr;
+	int err;
 	static const u8 mac[ETH_ALEN] = { 0x02, 0x4b, 0x49, 0x4c, 0x4c, 0x52 };
+
+	BUILD_BUG_ON(AREA_END > OB_SIZE);
 
 	err = pci_enable_device(pdev);
 	if (err)
@@ -475,11 +693,15 @@ static int kl_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	err = pci_request_regions(pdev, DRV_NAME);
 	if (err)
 		goto out_disable;
-	if (pci_resource_len(pdev, 0) < 0x100000 || pci_resource_len(pdev, 1) < 0x10000) {
-		dev_err(&pdev->dev, "unexpected BAR sizes\n");
+	if (pci_resource_len(pdev, 0) < 0x100000) {
+		dev_err(&pdev->dev, "BAR0 is not the 1 MB CCSR window\n");
 		err = -ENODEV;
 		goto out_release;
 	}
+	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
+	if (err)
+		goto out_release;
+	pci_set_master(pdev);
 
 	ndev = alloc_etherdev(sizeof(*k));
 	if (!ndev) {
@@ -492,12 +714,10 @@ static int kl_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	SET_NETDEV_DEV(ndev, &pdev->dev);
 
 	k->ccsr = pci_iomap(pdev, 0, 0);
-	k->win = pci_iomap(pdev, 1, 0);
-	if (!k->ccsr || !k->win) {
+	if (!k->ccsr) {
 		err = -EIO;
-		goto out_unmap;
+		goto out_free;
 	}
-
 	spridr = ioread32be(k->ccsr + CCSR_SPRIDR);
 	if (spridr >> 16 != 0x8101) {
 		dev_err(&pdev->dev, "SPRIDR %08x is not an MPC8308, refusing\n", spridr);
@@ -505,18 +725,23 @@ static int kl_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		goto out_unmap;
 	}
 
-	/* point BAR1 at card DDR */
-	iowrite32(DDR_WIN | 1, k->ccsr + PEX_EPIWTAR1);
-	tar = ioread32(k->ccsr + PEX_EPIWTAR1);
-	if (tar != (DDR_WIN | 1)) {
-		dev_err(&pdev->dev, "could not retarget BAR1 (epiwtar1=%08x)\n", tar);
-		err = -EIO;
+	k->area = dma_alloc_coherent(&pdev->dev, OB_SIZE, &k->area_dma, GFP_KERNEL);
+	if (!k->area) {
+		err = -ENOMEM;
 		goto out_unmap;
 	}
+	if (k->area_dma & (PAGE_SIZE - 1)) {
+		dev_err(&pdev->dev, "DMA region not page aligned (%pad)\n", &k->area_dma);
+		err = -EIO;
+		goto out_dma;
+	}
+	k->txbd = k->area + TXBD_OFF;
+	k->rxbd = k->area + RXBD_OFF;
+	ob_window_set(k, true);
+	iowrite32(DDR_WIN | 1, k->ccsr + PEX_EPIWTAR1);
 
 	spin_lock_init(&k->tx_lock);
-	mutex_init(&k->mdio_lock);
-	INIT_DELAYED_WORK(&k->link_work, kl_link_work);
+	INIT_WORK(&k->reset_work, kl_reset_work);
 	k->period = ns_to_ktime((u64)poll_us * NSEC_PER_USEC);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
 	hrtimer_setup(&k->timer, kl_timer_fn, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
@@ -526,31 +751,49 @@ static int kl_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 #endif
 	netif_napi_add(ndev, &k->napi, kl_napi_poll);
 
+	k->mii_bus = devm_mdiobus_alloc(&pdev->dev);
+	if (!k->mii_bus) {
+		err = -ENOMEM;
+		goto out_napi;
+	}
+	k->mii_bus->name = DRV_NAME " mdio";
+	k->mii_bus->read = kl_mdio_read;
+	k->mii_bus->write = kl_mdio_write;
+	k->mii_bus->priv = k;
+	k->mii_bus->parent = &pdev->dev;
+	k->mii_bus->phy_mask = ~(u32)BIT(PHY_ADDR);
+	snprintf(k->mii_bus->id, MII_BUS_ID_SIZE, "%s", pci_name(pdev));
+	miim_init(k);
+	err = mdiobus_register(k->mii_bus);
+	if (err) {
+		dev_err(&pdev->dev, "mdiobus_register failed (%d)\n", err);
+		goto out_napi;
+	}
+
 	ndev->netdev_ops = &kl_netdev_ops;
 	ndev->ethtool_ops = &kl_ethtool_ops;
+	ndev->watchdog_timeo = 5 * HZ;
 	ndev->max_mtu = ETH_DATA_LEN;
-	eth_hw_addr_set(ndev, mac);          /* TODO: real MAC lives in the card's i2c EEPROM */
-	netif_carrier_off(ndev);
-
-	miim_init(k);
-	id1 = phy_read(k, MII_PHYID1);
-	id2 = phy_read(k, MII_PHYID2);
+	eth_hw_addr_set(ndev, mac);          /* TODO: read the real one from the card's EEPROM */
 
 	err = register_netdev(ndev);
 	if (err)
-		goto out_napi;
+		goto out_mdio;
 	pci_set_drvdata(pdev, ndev);
-	dev_info(&pdev->dev, "Killer E2100: MPC8308 rev %u.%u, PHY id %04x%04x at addr %d, netdev %s\n",
-		 (spridr >> 4) & 0xf, spridr & 0xf, id1 & 0xffff, id2 & 0xffff, PHY_ADDR, ndev->name);
+	dev_info(&pdev->dev, "Killer E2100: MPC8308 rev %u.%u, DMA region %pad, netdev %s\n",
+		 (spridr >> 4) & 0xf, spridr & 0xf, &k->area_dma, ndev->name);
 	return 0;
 
+out_mdio:
+	mdiobus_unregister(k->mii_bus);
 out_napi:
 	netif_napi_del(&k->napi);
+	ob_window_set(k, false);
+out_dma:
+	dma_free_coherent(&pdev->dev, OB_SIZE, k->area, k->area_dma);
 out_unmap:
-	if (k->win)
-		pci_iounmap(pdev, k->win);
-	if (k->ccsr)
-		pci_iounmap(pdev, k->ccsr);
+	pci_iounmap(pdev, k->ccsr);
+out_free:
 	free_netdev(ndev);
 out_release:
 	pci_release_regions(pdev);
@@ -565,8 +808,11 @@ static void kl_remove(struct pci_dev *pdev)
 	struct kl *k = netdev_priv(ndev);
 
 	unregister_netdev(ndev);
+	cancel_work_sync(&k->reset_work);
+	mdiobus_unregister(k->mii_bus);
 	netif_napi_del(&k->napi);
-	pci_iounmap(pdev, k->win);
+	ob_window_set(k, false);           /* the card must lose its view of host RAM first */
+	dma_free_coherent(&pdev->dev, OB_SIZE, k->area, k->area_dma);
 	pci_iounmap(pdev, k->ccsr);
 	free_netdev(ndev);
 	pci_release_regions(pdev);
@@ -589,4 +835,6 @@ module_pci_driver(kl_driver);
 
 MODULE_AUTHOR("Mitch");
 MODULE_DESCRIPTION("Bigfoot Killer E2100 (MPC8308 eTSEC) ethernet driver");
+MODULE_VERSION(DRV_VERSION);
 MODULE_LICENSE("GPL");
+MODULE_SOFTDEP("pre: marvell");
