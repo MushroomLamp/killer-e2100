@@ -1,0 +1,10 @@
+  LBLAW0(flash?)   base=f0000000 ar=80000016 en=1 size=8 MiB
+  LBLAW1           base=e1ed0000 ar=8000000e en=1 size=0 MiB
+  LBLAW2           base=00000000 ar=00000000 en=0 size=0 MiB
+  LBLAW3           base=00000000 ar=00000000 en=0 size=0 MiB
+  PCILAW0          base=00000000 ar=00000016 en=0 size=8 MiB
+  PCILAW1          base=00000000 ar=00000000 en=0 size=0 MiB
+  LAW@0x80(PCIe?)  base=a0000000 ar=8000001c en=1 size=512 MiB
+  LAW@0x88         base=00000000 ar=00000000 en=0 size=0 MiB
+  DDRLAW0          base=00000000 ar=8000001a en=1 size=128 MiB
+  DDRLAW1          base=00000000 ar=00000000 en=0 size=0 MiB

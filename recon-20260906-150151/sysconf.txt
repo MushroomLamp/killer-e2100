@@ -1,0 +1,13 @@
+  SPCR               @0x110  = 00400000
+  SICRL              @0x114  = 01000040
+  SICRH              @0x118  = fc37f013
+  SWCRR(watchdog)    @0x204  = ffff0003
+  RCWLR              @0x900  = 44060000
+  RCWHR              @0x904  = 00606c00
+  RSR                @0x910  = 00000000
+  RCR                @0x91C  = 00000000
+  SPMR               @0xA00  = 44060000
+  OCCR               @0xA04  = 0000e080
+  SCCR(clock-gating) @0xA08  = 55500010
+  GP1DIR             @0xC00  = 80000000
+  GP1DAT             @0xC08  = e01fff00
