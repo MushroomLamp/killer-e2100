@@ -50,6 +50,11 @@
 
 /* ---- card address map ---- */
 #define CCSR_SPRIDR   0x108
+#define CCSR_PECR1    0x140    /* PCIe controller: bits 26-31 = DMA/descriptor/PIO CSB priority */
+#define CCSR_ACR      0x800    /* CSB arbiter: bit 7 COREDIS, bits 13-15 PIPE_DEP (outstanding transactions - 1) */
+#define ACR_COREDIS   0x01000000u
+#define ACR_PIPE_DEP_MASK 0x00070000u
+#define ACR_PIPE_DEP(n)   (((n) & 7) << 16)
 #define CCSR_SPCR     0x110    /* system priority: bits 18-23 = eTSEC data/BD/emergency CSB priority */
 #define SPCR_TSEC_PRIO(p) ((((p) & 3) << 13) | (((p) & 3) << 11) | (((p) & 3) << 9))
 #define SPCR_TSEC_MASK    SPCR_TSEC_PRIO(3)
@@ -225,6 +230,24 @@ MODULE_PARM_DESC(rx_batch, "max frames per write-DMA chain (1..64, default 64)")
 static int etsec_prio = 3;
 module_param(etsec_prio, int, 0444);
 MODULE_PARM_DESC(etsec_prio, "eTSEC bus priority 0..3 (default 3, highest)");
+
+/*
+ * CSB arbiter pipeline depth: how many bus transactions may be outstanding.
+ * The card's u-boot leaves it at 0 = ONE transaction at a time, so every
+ * 32-byte access pays full DRAM latency and the MAC and the DMA engine take
+ * turns. u-boot on Freescale's own boards uses 3 (depth 4).
+ */
+static int pipe_dep = 3;
+module_param(pipe_dep, int, 0444);
+MODULE_PARM_DESC(pipe_dep, "CSB arbiter pipeline depth field 0..7 (default 3 = 4 outstanding)");
+
+/* experiments */
+static int core_off;
+module_param(core_off, int, 0444);
+MODULE_PARM_DESC(core_off, "1: deny the card's idle PowerPC core the bus (ACR[COREDIS]) so it cannot compete");
+static int fifo_defaults;
+module_param(fifo_defaults, int, 0444);
+MODULE_PARM_DESC(fifo_defaults, "1: leave the eTSEC RX FIFO pause/alarm thresholds at their reset values");
 
 static int spin_us = 40;
 module_param(spin_us, int, 0444);
@@ -497,12 +520,17 @@ static void hw_start(struct kl *k)
 
 	iowrite32be((ioread32be(k->ccsr + CCSR_SPCR) & ~SPCR_TSEC_MASK) | SPCR_TSEC_PRIO(etsec_prio),
 		    k->ccsr + CCSR_SPCR);
+	dev_info(&k->pdev->dev, "bus: SPCR %08x PECR1 %08x ACR %08x (etsec_prio %d core_off %d fifo_defaults %d rx_batch %d)\n",
+		 ioread32be(k->ccsr + CCSR_SPCR), ioread32be(k->ccsr + CCSR_PECR1), ioread32be(k->ccsr + CCSR_ACR),
+		 etsec_prio, core_off, fifo_defaults, rx_batch);
 	mac_set_speed(k, k->speed, k->duplex == DUPLEX_FULL);
 	ew(k, FIFO_TX_THR, tx_thr);
-	ew(k, FIFO_RX_PAUSE, rx_pause_on);
-	ew(k, FIFO_RX_PAUSE_SHUTOFF, rx_pause_off);
-	ew(k, FIFO_RX_ALARM, rx_alarm_on);
-	ew(k, FIFO_RX_ALARM_SHUTOFF, rx_alarm_off);
+	if (!fifo_defaults) {
+		ew(k, FIFO_RX_PAUSE, rx_pause_on);
+		ew(k, FIFO_RX_PAUSE_SHUTOFF, rx_pause_off);
+		ew(k, FIFO_RX_ALARM, rx_alarm_on);
+		ew(k, FIFO_RX_ALARM_SHUTOFF, rx_alarm_off);
+	}
 	ew(k, MAXFRM, 1536);
 	mac_set_addr(k);
 	ew(k, IMASK, 0);
@@ -1031,6 +1059,13 @@ static int kl_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		goto out_dma;
 	}
 	k->txbd = k->area + TXBD_OFF;
+	{
+		u32 acr = ioread32be(k->ccsr + CCSR_ACR);
+		iowrite32be((acr & ~ACR_PIPE_DEP_MASK) | ACR_PIPE_DEP(pipe_dep) | (core_off ? ACR_COREDIS : 0),
+			    k->ccsr + CCSR_ACR);
+		dev_info(&pdev->dev, "CSB arbiter ACR %08x -> %08x (pipe_dep %d, core_off %d)\n",
+			 acr, ioread32be(k->ccsr + CCSR_ACR), pipe_dep, core_off);
+	}
 	ob_window_set(k, true);
 
 	spin_lock_init(&k->tx_lock);

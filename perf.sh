@@ -67,5 +67,6 @@ to=$(ethtool -S "$IF" | awk '/wdma_timeouts/{print $2}')
 we=$(ethtool -S "$IF" | awk '/wdma_errors/{print $2}')
 rdrp1=$(ethtool -S "$IF" | awk '/mac_rx_dropped/{print $2}')
 echo "== wdma chains +$((c1-c0)) timeouts $to errors $we | mac_rx_dropped +$((rdrp1-rdrp0)) =="
+dmesg | grep -E "bus: SPCR|CSB arbiter" | tail -n 2 | sed "s/^/   /"
 echo "-- all non-zero driver counters --"; ethtool -S "$IF" | awk '$2 != 0 && !/mac_(rx|tx)_(packets|bytes)/' | sed "s/^/   /"
 ip -s link show "$IF" | sed -n "4,5p" | sed "s/^/   /"
