@@ -7,7 +7,7 @@ HERE=$(dirname "$(readlink -f "$0")")
 DEV=0000:07:00.0
 # Cloudflare's speed endpoints are anycast: a nearby server from anywhere.
 # (speedtest.tele2.net is in Sweden: 420 ms RTT from Australia, useless for single-stream tests.)
-URL='https://speed.cloudflare.com/__down?bytes=100000000'
+URL='https://speed.cloudflare.com/__down?bytes=50000000'   # 100 MB gets a 403
 UPURL='https://speed.cloudflare.com/__up'
 trap 'nmcli radio wifi on >/dev/null 2>&1; echo "(wifi back on)"' EXIT
 
@@ -67,4 +67,5 @@ to=$(ethtool -S "$IF" | awk '/wdma_timeouts/{print $2}')
 we=$(ethtool -S "$IF" | awk '/wdma_errors/{print $2}')
 rdrp1=$(ethtool -S "$IF" | awk '/mac_rx_dropped/{print $2}')
 echo "== wdma chains +$((c1-c0)) timeouts $to errors $we | mac_rx_dropped +$((rdrp1-rdrp0)) =="
-ov=$(ethtool -S "$IF" | awk '/bd_rx_overrun/{print $2}'); echo "== bd_rx_overrun total ${ov:-0} =="
+echo "-- all non-zero driver counters --"; ethtool -S "$IF" | awk '$2 != 0 && !/mac_(rx|tx)_(packets|bytes)/' | sed "s/^/   /"
+ip -s link show "$IF" | sed -n "4,5p" | sed "s/^/   /"
