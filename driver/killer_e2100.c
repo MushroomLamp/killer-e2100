@@ -216,9 +216,9 @@ static int dmactrl = 0xc0;
 module_param(dmactrl, int, 0444);
 MODULE_PARM_DESC(dmactrl, "eTSEC DMACTRL (default 0xc0: TDSEN|TBDSEN)");
 
-static int gigabit;
+static int gigabit = 1;
 module_param(gigabit, int, 0444);
-MODULE_PARM_DESC(gigabit, "advertise 1000BASE-T (default 0)");
+MODULE_PARM_DESC(gigabit, "advertise 1000BASE-T (default 1)");
 
 static int flowctrl = 1;
 module_param(flowctrl, int, 0444);

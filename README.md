@@ -41,12 +41,25 @@ so nothing on the card competes for the hardware.
   as the in-tree `gianfar` driver.
 * The **Marvell 88E1116R** PHY at MDIO address 1 is handled by phylib, in
   `RGMII_ID` mode (the board straps both clock delays into the PHY).
-* **DMA**: a 1 MB coherent region in host RAM holds the descriptor rings and packet
-  buffers. The SoC's PCIe *outbound* window 1 is programmed to map card-local
-  `0xB0000000` onto that region, so the MAC's DMA engine reads and writes host
-  memory through it. The window is exactly the region's size, so the card cannot
-  address any other host memory. That matters because many boards this card ships
-  on (Sandy Bridge era) have no IOMMU.
+* **Receive**: the MAC's ring and buffers live in the card's own DDR, which it
+  fills at wire speed. Each NAPI poll gathers the frames that arrived, builds a
+  descriptor chain for the PCIe block's write-DMA engine, and starts it once. The
+  engine streams the frames into a 1 MB coherent region in host RAM as full
+  128-byte PCIe writes; a final marker descriptor copies a sequence number after
+  the data, and because PCIe posted writes are ordered, seeing it guarantees every
+  frame before it has landed. The SoC's PCIe outbound window 1 maps card-local
+  `0xB0000000` onto that region and nothing else, so the card cannot address any
+  other host memory. That matters because many boards this card ships on (Sandy
+  Bridge era) have no IOMMU.
+* **Transmit**: the ring and frames also live in card DDR; the host writes them
+  through BAR1. This is not for speed, it is for receive: if the MAC has to read
+  its transmit descriptors across PCIe, those reads queue behind the write-DMA
+  engine's posted writes (PCIe ordering), the MAC's single DMA unit stalls, and
+  its receive FIFO overruns. Keeping every MAC access on the card side was the
+  change that took receive from ~20% loss to zero at gigabit.
+* **Bus tuning**: the card's u-boot leaves the internal bus arbiter at a pipeline
+  depth of one outstanding transaction; the driver sets four, as Freescale's own
+  boards do.
 * **No interrupts**: the MAC's IRQ lines terminate in the card's own interrupt
   controller, which the host cannot see. NAPI is driven by an hrtimer (default
   500 µs, `poll_us=` module parameter). Ping RTT to the gateway is ~0.6 ms.
@@ -57,24 +70,23 @@ so nothing on the card competes for the hardware.
 |---|---|
 | Link, autoneg, 10/100/1000 | works (phylib + Marvell driver) |
 | TX / RX, DHCP, DNS, browsing | works |
-| Link | 10/100/1000 negotiated by phylib. **Reliable at 100 Mbit** (zero RX errors under sustained load) |
-| Gigabit | link trains, but sustained RX overruns the MAC FIFO: the eTSEC DMA into host RAM cannot be drained fast enough over the x1 Gen1 link. **Not yet reliable** — opt in with `gigabit=1`. Fixed properly by v0.3 |
+| Link | 10/100/1000 negotiated by phylib; gigabit is the default |
+| Receive at gigabit | **lossless**: in a 14k-frame TCP download the MAC counted 13,919 frames and the driver delivered 13,919; MAC-internal loopback runs at 987 Mbit into card DDR with zero overruns |
+| Throughput | 497 Mbit/s on a single TCP stream from a nearby server (a 20 MB transfer, so it includes the handshake and slow start: a floor). v0.2 managed 300; v0.1 15 |
 | MAC address | **locally administered placeholder** (`02:4b:49:4c:4c:52`). The real one is in the card's I2C EEPROM; reading it is in progress |
 | ethtool | link settings via phylib, drvinfo |
 | Jumbo frames, checksum offload, WoL | no |
 | Bigfoot's UDP offload / "Killer" features | never; the card's CPU is not used at all |
 
-Default link speed is 100 Mbit (`gigabit=0`), which the current receive path handles
-with no loss. `gigabit=1` raises the ceiling but is not yet reliable under load.
+### Roadmap
 
-### Roadmap: v0.3, the way Bigfoot did it
-
-The MPC8308's PCI Express block has its own descriptor-based DMA engine (write and
-read), fully documented in the reference manual (chapter 14; notes in
-`docs/pex-dma-notes.txt`). v0.3 will stage frames in the card's own DDR at wire speed
-and move them across the link with that engine instead of pointing the MAC's DMA
-straight at host RAM. That is how the original firmware sustained gigabit, and it
-removes the FIFO-drain bottleneck.
+* Transmit is host-PIO into card DDR through a 20-entry ring: plenty for a home
+  uplink, not for a gigabit LAN sender. The PCIe block's read-DMA engine (the twin of
+  the write engine already in use) is the obvious next step.
+* Interrupts: the MAC's IRQs terminate on the card. The PCIe block has inbound and
+  outbound mailbox registers that can raise MSI on the host; using them would replace
+  the 500 µs timer.
+* Real MAC address from the card's EEPROM, where one is populated.
 
 Tested on: Gigabyte G1.Sniper 2 (Z68, on-board E2100), Linux Mint 22.3, kernel 7.0.
 
