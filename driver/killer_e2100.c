@@ -336,6 +336,25 @@ static void wdma_kick(struct kl *k, u32 first_card, u32 seq)
 	pw(k, PEX_WDMA_CTRL, WDMA_START);
 }
 
+/* park and re-arm the engine: disable/enable WDMAE forces it to drop any stale chain */
+static void wdma_reset(struct kl *k)
+{
+	u32 c = pr(k, PEX_CSB_CTRL);
+	pw(k, PEX_WDMA_CTRL, 0);
+	pw(k, PEX_CSB_CTRL, c & ~CSB_WDMAE);
+	udelay(10);
+	pw(k, PEX_WDMA_STAT, 0x7f);
+	pw(k, PEX_CSB_CTRL, c | CSB_WDMAE);
+	udelay(10);
+}
+
+static void wdma_dump_desc(struct kl *k, const char *what, u32 off)
+{
+	dev_info(&k->pdev->dev, "  %s @%05x: %08x %08x %08x %08x %08x\n", what, off,
+		 ioread32(k->win + off), ioread32(k->win + off + 4), ioread32(k->win + off + 8),
+		 ioread32(k->win + off + 12), ioread32(k->win + off + 16));
+}
+
 /* returns 0 on success, -EIO if the engine did not deliver the marker */
 static int wdma_selftest_order(struct kl *k, int order)
 {
@@ -359,8 +378,11 @@ static int wdma_selftest_order(struct kl *k, int order)
 		udelay(1);
 	}
 	if (READ_ONCE(*marker(k)) != seq) {
-		dev_info(&k->pdev->dev, "wdma selftest order %d: no marker (stat %08x, ctrl %08x)\n",
-			 order, pr(k, PEX_WDMA_STAT), pr(k, PEX_WDMA_CTRL));
+		dev_info(&k->pdev->dev, "wdma selftest order %d: no marker (stat %08x ctrl %08x addr %08x csb %08x, marker %08x)\n",
+			 order, pr(k, PEX_WDMA_STAT), pr(k, PEX_WDMA_CTRL), pr(k, PEX_WDMA_ADDR),
+			 pr(k, PEX_CSB_CTRL), READ_ONCE(*marker(k)));
+		wdma_dump_desc(k, "data  ", d0);
+		wdma_dump_desc(k, "marker", d1);
 		return -EIO;
 	}
 	for (i = 0; i < 64; i++)
@@ -374,17 +396,21 @@ static int wdma_selftest_order(struct kl *k, int order)
 
 static int wdma_selftest(struct kl *k)
 {
-	int order;
+	static const int orders[] = { 1, 0 };     /* control-word-first is the one that works */
+	int attempt, i;
 
-	pw(k, PEX_CSB_CTRL, pr(k, PEX_CSB_CTRL) | CSB_WDMAE);
 	pw(k, PEX_DMA_DSTMR, 0x100);
-	for (order = 0; order < 2; order++) {
-		if (!wdma_selftest_order(k, order)) {
-			dev_info(&k->pdev->dev, "wdma selftest passed: descriptor order %d (%s)\n",
-				 order, order ? "control word first" : "next pointer first");
-			return 0;
+	for (attempt = 0; attempt < 3; attempt++) {
+		for (i = 0; i < 2; i++) {
+			wdma_reset(k);
+			if (!wdma_selftest_order(k, orders[i])) {
+				dev_info(&k->pdev->dev, "wdma selftest passed: descriptor order %d (%s)%s\n",
+					 orders[i], orders[i] ? "control word first" : "next pointer first",
+					 attempt ? " after retry" : "");
+				return 0;
+			}
 		}
-		pw(k, PEX_WDMA_STAT, 0x7f);
+		msleep(20);
 	}
 	return -EIO;
 }
@@ -493,7 +519,7 @@ static void hw_stop(struct kl *k)
 	for (i = 0; i < 100 && k->batch.active && READ_ONCE(*marker(k)) != k->batch.seq; i++)
 		udelay(100);
 	k->batch.active = false;
-	pw(k, PEX_WDMA_STAT, 0x7f);
+	wdma_reset(k);
 }
 
 /* ---------------- TX ---------------- */
@@ -1058,6 +1084,8 @@ static void kl_remove(struct pci_dev *pdev)
 	cancel_work_sync(&k->reset_work);
 	mdiobus_unregister(k->mii_bus);
 	netif_napi_del(&k->napi);
+	wdma_reset(k);
+	pw(k, PEX_CSB_CTRL, pr(k, PEX_CSB_CTRL) & ~CSB_WDMAE);
 	ob_window_set(k, false);           /* the card must lose its view of host RAM first */
 	dma_free_coherent(&pdev->dev, OB_SIZE, k->area, k->area_dma);
 	pci_iounmap(pdev, k->win);
