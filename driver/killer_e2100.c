@@ -174,9 +174,9 @@
 #define AREA_END (HSCR_OFF + 0x1000)
 
 /* ---- card DDR through BAR1 (card-local DDR_WIN + off, 64 KB) ---- */
-#define NRX 256
+#define NRX 512
 #define C_RXBD_OFF 0x0000                            /* NRX x 8 */
-#define C_DESC_OFF 0x1000                            /* (BATCH + 2) x 32 */
+#define C_DESC_OFF 0x1000                            /* (BATCH + 2) x 32; RX BDs use 0x0000..0x0FFF */
 #define C_SEQ_OFF  0x3000
 #define C_SCR_OFF  0x3800                            /* self-test pattern, 256 B */
 #define DESC_SZ 32
@@ -705,7 +705,7 @@ static int rx_poll(struct kl *k, int budget)
 			k->wdma_timeouts++;
 			rx_batch_abort(k, "timeout");
 		} else {
-			return 0;                    /* still in flight */
+			return budget;               /* in flight: ask NAPI to call us straight back */
 		}
 	}
 	if (work >= budget)
@@ -718,7 +718,7 @@ static int rx_poll(struct kl *k, int budget)
 			return work + rx_batch_deliver(k);
 		udelay(1);
 	}
-	return work;
+	return budget;                       /* big chain still copying: keep polling */
 }
 
 static void check_errors(struct kl *k)
@@ -951,6 +951,7 @@ static int kl_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	BUILD_BUG_ON(AREA_END > OB_SIZE);
 	BUILD_BUG_ON(C_DESC_OFF + (BATCH + 2) * DESC_SZ > C_SEQ_OFF);
+	BUILD_BUG_ON(C_RXBD_OFF + NRX * 8 > C_DESC_OFF);
 
 	err = pci_enable_device(pdev);
 	if (err)
