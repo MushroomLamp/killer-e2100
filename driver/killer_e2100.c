@@ -448,42 +448,81 @@ static int wdma_selftest_order(struct kl *k, int order)
 	return 0;
 }
 
-/* 8 KB from card DDR (outside the BAR1 window) to host, whole and in pieces */
-static int wdma_selftest_large(struct kl *k, int pieces)
+/*
+ * Probe the engine with realistic and oversized copies from card DDR
+ * (outside the BAR1 window, where the RX buffers live) into the host region.
+ * Returns bytes verified, or a negative errno. Also used to find the largest
+ * single-descriptor transfer the hardware honours (the manual says 18 bits of
+ * words; the silicon disagrees).
+ */
+static int wdma_copy_probe(struct kl *k, u32 bytes, u32 piece, u32 seq)
 {
-	u32 *hscr = k->area + HSCR_OFF, src = C_RXBUF, seq = 0xB16B0000u | pieces, d = C_DESC_OFF, off = 0;
-	u32 piece = 8192 / pieces;
+	u32 *dst = k->area + RXSLOT_OFF, src = C_RXBUF, d = C_DESC_OFF, off = 0, words = bytes / 4;
 	int i;
 
-	/* fill the source via the BAR1 window temporarily aimed at it */
+	/* fill the source through a temporarily retargeted BAR1, and prove the retarget took */
 	pw(k, PEX_EPIWTAR1, C_RXBUF | 1);
-	for (i = 0; i < 2048; i++)
-		iowrite32(0xA5000000u ^ (i * 0x9E3779B1u), k->win + i * 4);
-	(void)ioread32(k->win);
+	(void)pr(k, PEX_EPIWTAR1);
+	for (i = 0; i < (int)words; i++)
+		iowrite32(seq ^ (i * 0x9E3779B1u), k->win + i * 4);
+	if (ioread32(k->win) != seq || ioread32(k->win + (words - 1) * 4) != (seq ^ ((words - 1) * 0x9E3779B1u))) {
+		pw(k, PEX_EPIWTAR1, DDR_WIN | 1);
+		dev_info(&k->pdev->dev, "wdma probe: BAR1 retarget to the source did not take\n");
+		return -EIO;
+	}
 	pw(k, PEX_EPIWTAR1, DDR_WIN | 1);
-	memset(hscr, 0, 8192 > 0x1000 ? 0x1000 : 8192);
+	(void)pr(k, PEX_EPIWTAR1);
+	memset(dst, 0, bytes);
 	WRITE_ONCE(*marker(k), 0);
 	wmb();
-	for (i = 0; i < pieces; i++, off += piece, d += DESC_SZ)
-		wdma_desc(k, d, src + off, OB_BAR + RXSLOT_OFF + off, piece / 4, DDR_WIN + d + DESC_SZ);
+	for (; off < bytes; off += piece, d += DESC_SZ) {
+		u32 n = bytes - off < piece ? bytes - off : piece;
+		wdma_desc(k, d, src + off, OB_BAR + RXSLOT_OFF + off, n / 4, DDR_WIN + d + DESC_SZ);
+	}
 	wdma_desc(k, d, DDR_WIN + C_SEQ_OFF, OB_BAR + MARKER_OFF, 1, 0);
 	wdma_desc_null(k, d + DESC_SZ);
 	wdma_kick(k, DDR_WIN + C_DESC_OFF, seq);
 	for (i = 0; i < 5000 && READ_ONCE(*marker(k)) != seq; i++)
 		udelay(1);
-	if (READ_ONCE(*marker(k)) != seq) {
-		dev_info(&k->pdev->dev, "wdma large selftest (%d pieces): no marker, stat %08x\n", pieces, pr(k, PEX_WDMA_STAT));
+	if (READ_ONCE(*marker(k)) != seq)
+		return -ETIMEDOUT;
+	dma_rmb();
+	for (i = 0; i < (int)words; i++)
+		if (dst[i] != (seq ^ (i * 0x9E3779B1u)))
+			return i * 4;
+	return bytes;
+}
+
+static int wdma_selftest_large(struct kl *k)
+{
+	static const u32 sizes[] = { 1520, 2048, 4096, 8192 };
+	u32 maxok = 0;
+	int i, r;
+
+	/* frame-sized single descriptors and the chunked form must both be perfect */
+	r = wdma_copy_probe(k, 1520 * 4, 1520, 0xB16B0001u);
+	if (r != 1520 * 4) {
+		dev_info(&k->pdev->dev, "wdma large selftest: 4 x 1520 B FAILED (%d), stat %08x\n", r, pr(k, PEX_WDMA_STAT));
 		return -EIO;
 	}
-	dma_rmb();
-	hscr = k->area + RXSLOT_OFF;
-	for (i = 0; i < 2048; i++)
-		if (hscr[i] != (0xA5000000u ^ (i * 0x9E3779B1u))) {
-			dev_info(&k->pdev->dev, "wdma large selftest (%d pieces): data wrong at byte %d (%08x), desc0 status %08x\n",
-				 pieces, i * 4, hscr[i], ioread32(k->win + C_DESC_OFF + (k->desc_order ? 4 : 12)));
-			return -EIO;
-		}
-	dev_info(&k->pdev->dev, "wdma large selftest (%d pieces of %u): ok\n", pieces, piece);
+	r = wdma_copy_probe(k, 8192, 512, 0xB16B0002u);
+	if (r != 8192) {
+		dev_info(&k->pdev->dev, "wdma large selftest: 16 x 512 B FAILED (%d), stat %08x\n", r, pr(k, PEX_WDMA_STAT));
+		return -EIO;
+	}
+	/* informational: largest single descriptor the engine really moves */
+	for (i = 0; i < ARRAY_SIZE(sizes); i++) {
+		r = wdma_copy_probe(k, sizes[i], sizes[i], 0xB16B0010u + i);
+		if (r == (int)sizes[i])
+			maxok = sizes[i];
+		else
+			dev_info(&k->pdev->dev, "wdma probe: single %u-byte descriptor moved %d bytes\n", sizes[i], r);
+	}
+	dev_info(&k->pdev->dev, "wdma large selftest ok: 4x1520 and 16x512 verified; largest clean single descriptor %u B\n", maxok);
+	if (dma_chunk > (int)maxok && maxok) {
+		dev_info(&k->pdev->dev, "dma_chunk %d exceeds that; clamping to %u\n", dma_chunk, maxok);
+		dma_chunk = maxok;
+	}
 	return 0;
 }
 
@@ -500,9 +539,7 @@ static int wdma_selftest(struct kl *k)
 				dev_info(&k->pdev->dev, "wdma selftest passed: descriptor order %d (%s)%s\n",
 					 orders[i], orders[i] ? "control word first" : "next pointer first",
 					 attempt ? " after retry" : "");
-				if (wdma_selftest_large(k, 1) || wdma_selftest_large(k, 16))
-					return -EIO;
-				return 0;
+				return wdma_selftest_large(k);
 			}
 		}
 		msleep(20);
