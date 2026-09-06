@@ -191,6 +191,10 @@
 #define NDESC 512
 #define C_SEQ_OFF  0x5000
 #define C_SCR_OFF  0x5800                            /* self-test pattern, 256 B */
+#define C_TXBD_OFF 0x6000                            /* card-resident TX ring: NTX_CARD x 8 */
+#define C_TXBUF_OFF 0x8000                           /* NTX_CARD x TXSLOT, up to the end of the 64 KB window */
+#define NTX_CARD 20
+#define TXSLOT 1536
 #define DESC_SZ 32
 #define C_RXBUF (DDR_WIN + 0x100000)                 /* NRX x 2 KB, not host-visible */
 
@@ -261,6 +265,18 @@ static int fifo_defaults;
 module_param(fifo_defaults, int, 0444);
 MODULE_PARM_DESC(fifo_defaults, "1: leave the eTSEC RX FIFO pause/alarm thresholds at their reset values");
 
+/*
+ * Keep the TX ring and frames in card DDR instead of host RAM. With the ring
+ * in host RAM the MAC fetches every TX descriptor and frame across PCIe as
+ * non-posted reads, which PCIe forbids from overtaking the write-DMA
+ * engine's earlier posted writes; the MAC's single DMA unit then stalls
+ * behind a whole chain of RX writes and its RX FIFO overruns. In card DDR
+ * the MAC never reads across PCIe. Host writes frames through BAR1.
+ */
+static int tx_in_card = 1;
+module_param(tx_in_card, int, 0444);
+MODULE_PARM_DESC(tx_in_card, "TX ring in card DDR (1, default) or host RAM (0)");
+
 static int spin_us = 40;
 module_param(spin_us, int, 0444);
 MODULE_PARM_DESC(spin_us, "after starting a WDMA chain, wait up to this long for it in the same poll");
@@ -284,7 +300,7 @@ struct kl {
 	ktime_t period;
 	struct work_struct reset_work;
 	spinlock_t tx_lock;
-	unsigned int tx_head, tx_tail, tx_count, rx_cur;
+	unsigned int tx_head, tx_tail, tx_count, rx_cur, ntx;
 	int speed, duplex;
 	/* WDMA */
 	int desc_order;                   /* 0 = next pointer first in memory, 1 = control first */
@@ -310,6 +326,11 @@ static inline void pw(struct kl *k, u32 r, u32 v) { iowrite32(v, k->ccsr + r); }
 static inline u8 *txbuf(struct kl *k, unsigned int i) { return k->area + TXBUF_OFF + i * BUFSZ; }
 static inline u8 *rxslot(struct kl *k, unsigned int i) { return k->area + RXSLOT_OFF + i * BUFSZ; }
 static inline u32 *marker(struct kl *k) { return k->area + MARKER_OFF; }
+static inline void __iomem *ctxbd(struct kl *k, unsigned int i) { return k->win + C_TXBD_OFF + i * 8; }
+static inline u16 txbd_status(struct kl *k, unsigned int i)
+{
+	return tx_in_card ? ioread16be(ctxbd(k, i)) : be16_to_cpu(READ_ONCE(k->txbd[i].status));
+}
 
 /* ---------------- MDIO (process context only) ---------------- */
 static int miim_wait(struct kl *k, u32 mask)
@@ -582,10 +603,16 @@ static void kl_set_rx_mode(struct net_device *ndev)
 static void rings_init(struct kl *k)
 {
 	int i;
+	k->ntx = tx_in_card ? NTX_CARD : NTX;
 	for (i = 0; i < NTX; i++) {
 		k->txbd[i].buf = cpu_to_be32(OB_BAR + TXBUF_OFF + i * BUFSZ);
 		k->txbd[i].len = 0;
 		k->txbd[i].status = cpu_to_be16(i == NTX - 1 ? TXBD_WRAP : 0);
+	}
+	for (i = 0; i < NTX_CARD; i++) {
+		iowrite32be(DDR_WIN + C_TXBUF_OFF + i * TXSLOT, ctxbd(k, i) + 4);
+		iowrite16be(0, ctxbd(k, i) + 2);
+		iowrite16be(i == NTX_CARD - 1 ? TXBD_WRAP : 0, ctxbd(k, i));
 	}
 	for (i = 0; i < NRX; i++) {
 		void __iomem *bd = k->win + C_RXBD_OFF + i * 8;
@@ -611,9 +638,9 @@ static void hw_start(struct kl *k)
 
 	iowrite32be((ioread32be(k->ccsr + CCSR_SPCR) & ~SPCR_TSEC_MASK) | SPCR_TSEC_PRIO(etsec_prio),
 		    k->ccsr + CCSR_SPCR);
-	dev_info(&k->pdev->dev, "bus: SPCR %08x PECR1 %08x ACR %08x (etsec_prio %d fifo_defaults %d rx_batch %d dma_chunk %d)\n",
+	dev_info(&k->pdev->dev, "bus: SPCR %08x PECR1 %08x ACR %08x (etsec_prio %d fifo_defaults %d rx_batch %d dma_chunk %d tx_in_card %d)\n",
 		 ioread32be(k->ccsr + CCSR_SPCR), ioread32be(k->ccsr + CCSR_PECR1), ioread32be(k->ccsr + CCSR_ACR),
-		 etsec_prio, fifo_defaults, rx_batch, dma_chunk);
+		 etsec_prio, fifo_defaults, rx_batch, dma_chunk, tx_in_card);
 	mac_set_speed(k, k->speed, k->duplex == DUPLEX_FULL);
 	ew(k, FIFO_TX_THR, tx_thr);
 	if (!fifo_defaults) {
@@ -632,7 +659,7 @@ static void hw_start(struct kl *k)
 	ew(k, RBASEH, 0);
 	ew(k, RBASE0, DDR_WIN + C_RXBD_OFF);
 	ew(k, TBASEH, 0);
-	ew(k, TBASE0, OB_BAR + TXBD_OFF);
+	ew(k, TBASE0, tx_in_card ? DDR_WIN + C_TXBD_OFF : OB_BAR + TXBD_OFF);
 	ew(k, RQUEUE, RQUEUE_EN0);
 	ew(k, TQUEUE, TQUEUE_EN0);
 	kl_set_rx_mode(k->ndev);
@@ -662,6 +689,7 @@ static void hw_stop(struct kl *k)
 }
 
 /* ---------------- TX ---------------- */
+
 static netdev_tx_t kl_xmit(struct sk_buff *skb, struct net_device *ndev)
 {
 	struct kl *k = netdev_priv(ndev);
@@ -672,27 +700,34 @@ static netdev_tx_t kl_xmit(struct sk_buff *skb, struct net_device *ndev)
 		ndev->stats.tx_dropped++;
 		return NETDEV_TX_OK;
 	}
-	if (skb->len > BUFSZ) {
+	if (skb->len > (tx_in_card ? TXSLOT : BUFSZ)) {
 		ndev->stats.tx_dropped++;
 		dev_kfree_skb_any(skb);
 		return NETDEV_TX_OK;
 	}
 
 	spin_lock_irqsave(&k->tx_lock, flags);
-	if (k->tx_count >= NTX) {
+	if (k->tx_count >= k->ntx) {
 		netif_stop_queue(ndev);
 		spin_unlock_irqrestore(&k->tx_lock, flags);
 		return NETDEV_TX_BUSY;
 	}
 	i = k->tx_head;
-	skb_copy_from_linear_data(skb, txbuf(k, i), skb->len);
-	k->txbd[i].len = cpu_to_be16(skb->len);
-	dma_wmb();
-	k->txbd[i].status = cpu_to_be16(TXBD_READY | TXBD_LAST | TXBD_CRC | (i == NTX - 1 ? TXBD_WRAP : 0));
+	if (tx_in_card) {
+		memcpy_toio(k->win + C_TXBUF_OFF + i * TXSLOT, skb->data, skb->len);
+		iowrite16be(skb->len, ctxbd(k, i) + 2);
+		wmb();
+		iowrite16be(TXBD_READY | TXBD_LAST | TXBD_CRC | (i == k->ntx - 1 ? TXBD_WRAP : 0), ctxbd(k, i));
+	} else {
+		skb_copy_from_linear_data(skb, txbuf(k, i), skb->len);
+		k->txbd[i].len = cpu_to_be16(skb->len);
+		dma_wmb();
+		k->txbd[i].status = cpu_to_be16(TXBD_READY | TXBD_LAST | TXBD_CRC | (i == k->ntx - 1 ? TXBD_WRAP : 0));
+	}
 	wmb();
 	ew(k, TSTAT, TSTAT_THLT0);
-	k->tx_head = (i + 1) % NTX;
-	if (++k->tx_count == NTX)
+	k->tx_head = (i + 1) % k->ntx;
+	if (++k->tx_count == k->ntx)
 		netif_stop_queue(ndev);
 	ndev->stats.tx_packets++;
 	ndev->stats.tx_bytes += skb->len;
@@ -707,12 +742,12 @@ static void tx_reap(struct kl *k)
 	unsigned long flags;
 	spin_lock_irqsave(&k->tx_lock, flags);
 	while (k->tx_count) {
-		if (be16_to_cpu(READ_ONCE(k->txbd[k->tx_tail].status)) & TXBD_READY)
+		if (txbd_status(k, k->tx_tail) & TXBD_READY)
 			break;
-		k->tx_tail = (k->tx_tail + 1) % NTX;
+		k->tx_tail = (k->tx_tail + 1) % k->ntx;
 		k->tx_count--;
 	}
-	if (netif_queue_stopped(k->ndev) && k->tx_count < NTX)
+	if (netif_queue_stopped(k->ndev) && k->tx_count < k->ntx)
 		netif_wake_queue(k->ndev);
 	spin_unlock_irqrestore(&k->tx_lock, flags);
 }
@@ -1105,6 +1140,8 @@ static int kl_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	BUILD_BUG_ON(AREA_END > OB_SIZE);
 	BUILD_BUG_ON(C_DESC_OFF + NDESC * DESC_SZ > C_SEQ_OFF);
 	BUILD_BUG_ON(C_RXBD_OFF + NRX * 8 > C_DESC_OFF);
+	BUILD_BUG_ON(C_TXBUF_OFF + NTX_CARD * TXSLOT > 0x10000);
+	BUILD_BUG_ON(C_TXBD_OFF + NTX_CARD * 8 > C_TXBUF_OFF);
 	rx_batch = clamp(rx_batch, 1, BATCH);
 	dma_chunk = clamp(dma_chunk, 64, BUFSZ) & ~63;
 
