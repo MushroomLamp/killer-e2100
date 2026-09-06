@@ -288,6 +288,7 @@ struct kl {
 	u64 bd_tr, bd_ov, bd_cr, bd_sh, bd_no, bd_lg, bd_frag;
 	u64 ev_xfun, ev_txe, ev_bsy, ev_eberr;
 	u64 wdma_chains, wdma_timeouts, wdma_errors;
+	u32 acr_orig;
 };
 
 static inline u32 er(struct kl *k, u32 r) { return ioread32be(k->ccsr + ETSEC + r); }
@@ -1061,8 +1062,9 @@ static int kl_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	k->txbd = k->area + TXBD_OFF;
 	{
 		u32 acr = ioread32be(k->ccsr + CCSR_ACR);
-		iowrite32be((acr & ~ACR_PIPE_DEP_MASK) | ACR_PIPE_DEP(pipe_dep) | (core_off ? ACR_COREDIS : 0),
-			    k->ccsr + CCSR_ACR);
+		k->acr_orig = acr & ~ACR_COREDIS;      /* never leave the core disabled behind us */
+		iowrite32be((acr & ~(ACR_PIPE_DEP_MASK | ACR_COREDIS)) | ACR_PIPE_DEP(pipe_dep) |
+			    (core_off ? ACR_COREDIS : 0), k->ccsr + CCSR_ACR);
 		dev_info(&pdev->dev, "CSB arbiter ACR %08x -> %08x (pipe_dep %d, core_off %d)\n",
 			 acr, ioread32be(k->ccsr + CCSR_ACR), pipe_dep, core_off);
 	}
@@ -1144,6 +1146,7 @@ static void kl_remove(struct pci_dev *pdev)
 	wdma_reset(k);
 	pw(k, PEX_CSB_CTRL, pr(k, PEX_CSB_CTRL) & ~CSB_WDMAE);
 	ob_window_set(k, false);           /* the card must lose its view of host RAM first */
+	iowrite32be(k->acr_orig, k->ccsr + CCSR_ACR);
 	dma_free_coherent(&pdev->dev, OB_SIZE, k->area, k->area_dma);
 	pci_iounmap(pdev, k->win);
 	pci_iounmap(pdev, k->ccsr);
